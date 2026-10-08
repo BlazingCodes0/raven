@@ -1,3 +1,4 @@
+import html
 import ipaddress
 import json
 import os
@@ -4442,6 +4443,253 @@ class LifelinePane(QWidget):
             pass
 
 
+NEST_RE = re.compile(
+    r"\bnest\b(?:\s+(?:at|to|on)\s+)?(?:the\s+)?(?:wifi\s+)?(?:network\s+)?(?:named\s+|called\s+)?([\w.\- ]+?)[\s.!?;:]*$"
+    r"|\bbid me to nest at\s+([\w.\- ]+?)[\s.!?;:]*$"
+    r"|\bjoin\s+the?\s+wifi\s+(?:named\s+|called\s+)?([\w.\- ]+?)[\s.!?;:]*$"
+    r"|\bconnect\s+(?:me\s+)?to\s+(?:the\s+)?wifi\s+(?:named\s+|called\s+)?([\w.\- ]+?)[\s.!?;:]*$",
+    re.IGNORECASE,
+)
+
+
+class AskRavenTerm(QWidget):
+    """Birdshit's own ASK RAVEN terminal.
+
+    Type plain language or a real shell command:
+      "nest at TELSU0773"        -> join that wifi using the key this box already
+                                    holds (the key is used but never printed)
+      "map my network"           -> passed to the crow runner
+      any shell command          -> runs right here for authorized-lab study
+    """
+
+    def __init__(self, log, report):
+        super().__init__()
+        self.log = log
+        self.report = report
+        self.proc = None
+        self._nest_step = None
+        self._nest_ssid = None
+        self._nest_dev = None
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        lbl = QLabel("ASK RAVEN TERMINAL")
+        lbl.setStyleSheet(f"color: {NEON2}; font-size: 11px; letter-spacing: 2px;")
+        row.addWidget(lbl)
+        self.edit = QLineEdit()
+        self.edit.setPlaceholderText(
+            '"nest at TELSU0773" · "map my network" · "scan 10.0.0.5" · or a shell command'
+        )
+        self.edit.returnPressed.connect(self.execute)
+        row.addWidget(self.edit, 1)
+        self.go = QPushButton("GO")
+        self.go.clicked.connect(self.execute)
+        row.addWidget(self.go)
+        lay.addLayout(row)
+
+        hint = QLabel(
+            '"nest at <ssid>" jumps to a wifi you own — the saved key is found in the '
+            "system store and used, never echoed. everything else runs through the shell."
+        )
+        hint.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        lay.addWidget(hint)
+
+        self.view = QPlainTextEdit()
+        self.view.setReadOnly(True)
+        self.view.setMaximumHeight(170)
+        self.view.document().setMaximumBlockCount(900)
+        lay.addWidget(self.view)
+
+    # --- transcript -------------------------------------------------------
+    def speak(self, line, color=None):
+        if color:
+            self.view.appendHtml(f'<span style="color:{color};">{html.escape(line)}</span>')
+        else:
+            self.view.appendPlainText(line)
+        cur = self.view.textCursor()
+        cur.movePosition(QTextCursor.MoveOperation.End)
+        self.view.setTextCursor(cur)
+
+    def execute(self):
+        text = self.edit.text().strip()
+        self.edit.clear()
+        if not text:
+            self.speak("raven is listening — tell it a wish or a command.", MUTED)
+            return
+        if self.proc is not None:
+            self.speak("raven: one command at a time — wait for this one to finish.", MUTED)
+            return
+        self.speak(f"$ {text}", NEON)
+        low = text.lower()
+        m = NEST_RE.search(low)
+        if m:
+            ssid = next((g for g in m.groups() if g), None)
+            if not ssid:
+                self.speak("raven: nest needs a network name — try 'nest at TELSU0773'.", MUTED)
+                return
+            self._nest(ssid.strip(" \t.!?;:"))
+            return
+        if re.match(r"^\s*nest\b", low):
+            self.speak("raven: nest needs a network name — try 'nest at TELSU0773'.", MUTED)
+            return
+        self._shell(text)
+
+    # --- plain shell passthrough ------------------------------------------
+    def _shell(self, text):
+        if not shutil.which("bash"):
+            self.speak("raven: no bash on this box — can't run that.", SEV_CRIT)
+            return
+        self.proc = QProcess(self)
+        self.proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self.proc.readyReadStandardOutput.connect(self._drain)
+        self.proc.finished.connect(self._done)
+        self.proc.start("bash", ["-lc", text])
+
+    def _drain(self):
+        data = bytes(self.proc.readAllStandardOutput()).decode("utf-8", "replace")
+        if data:
+            for line in data.splitlines():
+                self.speak(line)
+            self.log("[birdshit] " + data.strip())
+
+    def _done(self, code, _status):
+        if self._nest_step:
+            self._nest_done(code)
+            return
+        self.speak(f"[exit {code}]", SEV_CRIT if code else SEV_INFO)
+        self.proc = None
+
+    # --- nest: join an authorized wifi with the box's stored key ----------
+    def _nest(self, ssid):
+        if not ssid:
+            self.speak("raven: nest needs a network name — try 'nest at TELSU0773'.", MUTED)
+            return
+        if not shutil.which("nmcli"):
+            self.speak("raven: nmcli is not installed here — I can't manage wifi from this box.", SEV_CRIT)
+            return
+        dev = self._wifi_device()
+        if not dev:
+            self.speak("raven: no wifi radio found on this box.", SEV_CRIT)
+            return
+        now = self._wifi_now()
+        if now and now.lower() == ssid.lower():
+            self.speak(f"raven: already nested at {now} on {dev} — nothing to do.", SEV_INFO)
+            return
+        self._nest_step = "plain"
+        self._nest_ssid = ssid
+        self._nest_dev = dev
+        self.speak(f"raven nesting at {ssid} via {dev} (key stays secret)…", NEON)
+        self._start_nm(["dev", "wifi", "connect", ssid])
+
+    def _wifi_device(self):
+        try:
+            out = subprocess.run(
+                ["nmcli", "-t", "-f", "DEVICE,TYPE,STATE", "device"],
+                capture_output=True, text=True, timeout=8,
+            ).stdout or ""
+        except Exception:
+            return None
+        for line in out.splitlines():
+            f = line.rstrip(":").split(":")
+            if len(f) >= 2 and f[1] == "wifi":
+                return f[0]
+        return None
+
+    def _wifi_now(self):
+        try:
+            out = subprocess.run(
+                ["nmcli", "-t", "-f", "IN-USE,SSID", "dev", "wifi"],
+                capture_output=True, text=True, timeout=10,
+            ).stdout or ""
+        except Exception:
+            return None
+        for line in out.splitlines():
+            f = line.split(":")
+            if f and f[0] == "*":
+                return f[1] if len(f) > 1 else ""
+        return None
+
+    def _start_nm(self, args):
+        self.proc = QProcess(self)
+        self.proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self.proc.readyReadStandardOutput.connect(self._drain)
+        self.proc.finished.connect(self._done)
+        self.proc.start("nmcli", args)
+
+    def _stored_psk(self, ssid):
+        """Find the saved key without printing it. Returns a string or None."""
+        cands = []
+        conn_dir = Path("/etc/NetworkManager/system-connections")
+        if conn_dir.is_dir():
+            for f in conn_dir.glob("*.nmconnection"):
+                if ssid.lower() in f.name.lower():
+                    cands.append(f)
+        supp = Path("/etc/wpa_supplicant/wpa_supplicant.conf")
+        if supp.exists():
+            cands.append(supp)
+        for p in cands:
+            try:
+                txt = subprocess.run(
+                    ["sudo", "-n", "cat", str(p)],
+                    capture_output=True, text=True, timeout=8,
+                ).stdout or ""
+            except Exception:
+                continue
+            m = re.search(r"(?m)^\s*psk\s*=\s*\"?([^\"\s]+)\"?\s*$", txt)
+            if m and m.group(1) not in ("0", "1"):
+                return m.group(1)
+        return None
+
+    def _ip_of(self, dev):
+        try:
+            out = subprocess.run(
+                ["nmcli", "-t", "-g", "IP4.ADDRESS", "dev", "show", dev],
+                capture_output=True, text=True, timeout=8,
+            ).stdout or ""
+        except Exception:
+            return ""
+        return out.strip().splitlines()[0] if out.strip() else ""
+
+    def _nest_done(self, code):
+        ssid, dev = self._nest_ssid, self._nest_dev
+        if code == 0:
+            ip = self._ip_of(dev) or "?"
+            self.speak(f"raven nested at {ssid} on {dev} — ip {ip}", SEV_INFO)
+            self.speak(
+                "confirm this is a network you own/authorize before continuing, "
+                "then keep within scope.",
+                MUTED,
+            )
+            self.report(f"raven nested at {ssid} on {dev} — ip {ip}")
+            self.log(f"[birdshit] nest {ssid} on {dev} ip {ip}")
+        elif self._nest_step == "plain":
+            psk = self._stored_psk(ssid)
+            if psk:
+                self.speak("raven found the key in the system store — retrying quietly…", NEON)
+                self._nest_step = "withpsk"
+                self._start_nm(["dev", "wifi", "connect", ssid, "password", psk])
+                return
+            self.speak(
+                "raven couldn't nest and has no stored key for that network. "
+                "run it once yourself — 'nmcli --ask device wifi connect <ssid>' — "
+                "and the key will be remembered for next time.",
+                SEV_CRIT,
+            )
+        else:
+            self.speak(f"nest failed even with the stored key — is {ssid} in range?", SEV_CRIT)
+        self._nest_reset()
+
+    def _nest_reset(self):
+        self._nest_step = None
+        self._nest_ssid = None
+        self._nest_dev = None
+        self.proc = None
+
+
 class Raven(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -4505,6 +4753,8 @@ class Raven(QMainWindow):
 
         # Birdshit — pentest study
         bird = Panel("BIRDSHIT", "penetration study // exploitation and post-exploitation")
+        self.bird_term = AskRavenTerm(self.log, self.report)
+        bird.add(self.bird_term)
         self.bird = ReconPane(self.log, self.report, tools=PENTEST_TOOLS, tag="birdshit")
         bird.add(self.bird)
         self.tabs.addTab(bird, "Birdshit")
