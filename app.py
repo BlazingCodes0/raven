@@ -4479,6 +4479,7 @@ class AskRavenTerm(QWidget):
         self._nest_dev = None
         self._pen = None          # active attack state (dict) or None
         self._cap_proc = None     # background airodump handle
+        self._crow = None         # optional link to CrowPane for plain language
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -4501,8 +4502,8 @@ class AskRavenTerm(QWidget):
         lay.addLayout(row)
 
         hint = QLabel(
-            '"nest at <ssid>" jumps to a wifi you own — the saved key is found in the '
-            "system store and used, never echoed. everything else runs through the shell."
+            '"nest at <ssid>" jumps to a wifi you own (saved key used, never echoed). '
+            "plain english like 'all eyes on me' spawns a crow; real commands run as a shell."
         )
         hint.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
         lay.addWidget(hint)
@@ -4512,6 +4513,10 @@ class AskRavenTerm(QWidget):
         self.view.setMaximumHeight(170)
         self.view.document().setMaximumBlockCount(900)
         lay.addWidget(self.view)
+
+    def set_crow(self, crow):
+        """Link the Crow tab so plain language like 'all eyes on me' spawns a crow."""
+        self._crow = crow
 
     # --- transcript -------------------------------------------------------
     def speak(self, line, color=None):
@@ -4553,7 +4558,27 @@ class AskRavenTerm(QWidget):
         if re.match(r"^\s*nest\b", low):
             self.speak("raven: nest needs a network name — try 'nest at TELSU0773'.", MUTED)
             return
-        self._shell(text)
+        if self._is_command(text):
+            self._shell(text)
+        elif self._crow is not None and self._crow.active is None:
+            self._crow.ask_edit.setText(text)
+            self._crow.obey()
+            self.speak("raven recognized that — released a crow (watch the Crow tab).", NEON)
+        else:
+            self.speak("raven: that reads as plain English, not a command — and no crow slot is open yet.", MUTED)
+
+    def _is_command(self, text):
+        toks = text.split()
+        if not toks:
+            return False
+        first = toks[0].lstrip("$")
+        if first in TOOL_COMMANDS:
+            return True
+        if re.search(r"[|;&`$()]", text):
+            return True
+        if shutil.which(first.split("/")[-1]):
+            return True
+        return False
 
     # --- plain shell passthrough ------------------------------------------
     def _shell(self, text):
@@ -5004,6 +5029,7 @@ class Raven(QMainWindow):
         # Crow — autonomous agents
         crow = Panel("CROW", "spawn an agent // recon or penetrator on autopilot")
         self.crow = CrowPane(self.log, self.report)
+        self.bird_term.set_crow(self.crow)
         crow_scroll = QScrollArea()
         crow_scroll.setWidgetResizable(True)
         crow_scroll.setFrameShape(QFrame.Shape.NoFrame)
