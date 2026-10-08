@@ -730,6 +730,7 @@ class ReconToolPage(QWidget):
 
         self.out = QPlainTextEdit()
         self.out.setReadOnly(True)
+        self.out.document().setMaximumBlockCount(600)
         self.out.setPlaceholderText(f"output of {tool['name']} appears here")
         lay.addWidget(self.out, 1)
 
@@ -1734,6 +1735,7 @@ class CrowView(QWidget):
 
         self.out = QPlainTextEdit()
         self.out.setReadOnly(True)
+        self.out.document().setMaximumBlockCount(4000)
         self.out.setPlaceholderText(f"{crow['name']} barks here as it works…")
         mid.addWidget(self.out, 1)
         lay.addLayout(mid, 1)
@@ -4042,6 +4044,7 @@ class LifelinePane(QWidget):
 
         self.events = QPlainTextEdit()
         self.events.setReadOnly(True)
+        self.events.document().setMaximumBlockCount(2000)
         self.events.setPlaceholderText("the twin's own ledger lives in /tmp/ravenheart/events.log")
         root.addWidget(self.events, 1)
 
@@ -5670,6 +5673,7 @@ class Raven(QMainWindow):
         self.tabs.setDocumentMode(True)
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
+        self.log_view.document().setMaximumBlockCount(5000)
         self.log_view.setPlaceholderText("stdout / stderr appears here")
         self.build_tabs()
         lay.addWidget(self.tabs, 1)
