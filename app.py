@@ -4951,6 +4951,333 @@ class AskRavenTerm(QWidget):
             return -1, repr(ex)
 
 
+class DyePane(QWidget):
+    """DYE — contact forensics + media canary.
+
+    Passively logs every device that reaches this laptop (arp / dhcp / mdns /
+    tls-sni on its own interfaces, or clients associating to a hotspot this
+    laptop hosts) and stamps removable media with a hidden canary token, so a
+    drive that touched this box is identifiable if it ever comes back.
+    """
+
+    def __init__(self, log, report):
+        super().__init__()
+        self.log = log
+        self.report = report
+        self.dir = ROOT / "dye"
+        self.dir.mkdir(exist_ok=True)
+        self.contacts_f = self.dir / "contacts.json"
+        self.dyed_f = self.dir / "dyed.json"
+        self.contacts = self._load(self.contacts_f)
+        self.dyed = self._load(self.dyed_f, {"media": {}, "drops": {}})
+        self.oui = None
+        self.cwatch_on = False
+        self._cwatch = None
+        self.mount_root = Path(f"/run/media/{Path.home().name}")
+        if not self.mount_root.exists():
+            self.mount_root = Path.home() / "media"
+        self.mount_root.mkdir(exist_ok=True)
+        self._local_macs = self._scan_local_macs()
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.icount = QLabel(f"contacts {len(self.contacts)}")
+        self.icount.setStyleSheet(f"color: {MUTED}; font-size: 12px;")
+        row.addWidget(self.icount)
+        row.addStretch(1)
+        self.btn_watch = QPushButton("PAUSE CONTACT WATCH")
+        self.btn_watch.clicked.connect(self.toggle_watch)
+        row.addWidget(self.btn_watch)
+        self.btn_dye = QPushButton("DYE THE DROP FOLDER")
+        self.btn_dye.clicked.connect(self.dye_drop)
+        row.addWidget(self.btn_dye)
+        self.btn_export = QPushButton("EXPORT REPORT")
+        self.btn_export.clicked.connect(self.export_report)
+        row.addWidget(self.btn_export)
+        lay.addLayout(row)
+
+        self.view = QPlainTextEdit()
+        self.view.setReadOnly(True)
+        self.view.document().setMaximumBlockCount(2000)
+        lay.addWidget(self.view)
+
+        self.tick = QTimer(self)
+        self.tick.timeout.connect(self._media_poll)
+        self.tick.start(3000)
+        self._media_poll()
+        self.start_watch()
+        self.speak("dye armed: passive contact watch on, media poll every 3s", SEV_INFO)
+
+    # --- persistence ------------------------------------------------------
+    def _load(self, path, default=None):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception:
+            return {} if default is None else default
+
+    def _save(self, data, path):
+        try:
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(data, indent=1, sort_keys=True))
+            tmp.replace(path)
+        except Exception as e:
+            self.log(f"[dye] save failed: {e}")
+
+    def speak(self, line, color=None):
+        if color:
+            self.view.appendHtml(f'<span style="color:{color};">{html.escape(line)}</span>')
+        else:
+            self.view.appendPlainText(line)
+        self.log("[dye] " + line)
+
+    # --- contact watch ----------------------------------------------------
+    def _scan_local_macs(self):
+        macs = set()
+        try:
+            out = subprocess.run(["ip", "-o", "link", "show"], capture_output=True, text=True, timeout=5).stdout
+            for m in re.finditer(r"link/ether ([\da-f:]+)", out.lower()):
+                macs.add(m.group(1))
+        except Exception:
+            pass
+        return macs
+
+    def _oui(self, mac):
+        if self.oui is None:
+            self.oui = {}
+            try:
+                with open("/usr/share/ieee-data/oui.txt", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        if "\t(hex)" not in line:
+                            continue
+                        code = line.split("\t(hex)")[0].strip().upper()
+                        vendor = line.rsplit("\t", 1)[-1].strip()
+                        if code:
+                            self.oui[code] = vendor
+            except Exception:
+                pass
+        prefix = mac.replace(":", "-").upper()[:8]
+        return self.oui.get(prefix, "")
+
+    def _watch_bin(self):
+        iface = default_iface()
+        return [
+            "tshark", "-l", "-i", iface, "-a", "duration:25",
+            "-Y", "arp or bootp or mdns or nbns or tls.handshake.extensions_server_name",
+            "-T", "fields",
+            "-e", "frame.time", "-e", "eth.src", "-e", "arp.src.hw_mac", "-e", "ip.src",
+            "-e", "bootp.option.hostname", "-e", "tls.handshake.extensions_server_name",
+            "-e", "_ws.col.Info",
+        ]
+
+    def start_watch(self):
+        if self.cwatch_on:
+            return
+        self.cwatch_on = True
+        self.btn_watch.setText("PAUSE CONTACT WATCH")
+        self._start_cwatch()
+
+    def _start_cwatch(self):
+        if not self.cwatch_on:
+            return
+        argv = self._watch_bin()
+        try:
+            self._cwatch = QProcess(self)
+            self._cwatch.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+            self._cwatch.readyReadStandardOutput.connect(self._watch_drain)
+            self._cwatch.finished.connect(self._watch_done)
+            self._cwatch.start(argv[0], argv[1:])
+        except Exception as e:
+            self.speak(f"contact watch couldn't start: {e}", SEV_CRIT)
+            self.cwatch_on = False
+
+    def toggle_watch(self):
+        if self.cwatch_on:
+            self.cwatch_on = False
+            if self._cwatch:
+                self._cwatch.terminate()
+            self.btn_watch.setText("RESUME CONTACT WATCH")
+            self.speak("contact watch paused", SEV_MED)
+        else:
+            self.start_watch()
+            self.speak("contact watch resumed", SEV_INFO)
+
+    def _watch_drain(self):
+        try:
+            data = bytes(self._cwatch.readAllStandardOutput()).decode("utf-8", "replace")
+        except Exception:
+            return
+        if data:
+            self._contact_feed(data)
+
+    def _watch_done(self, _c, _s):
+        self._cwatch = None
+        if self.cwatch_on:
+            QTimer.singleShot(300, self._start_cwatch)
+
+    def _contact_feed(self, data):
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        for line in data.splitlines():
+            f = line.split("\t")
+            if len(f) < 7:
+                continue
+            mac = (f[1] or f[2] or "").lower()
+            if not mac or mac in self._local_macs:
+                continue
+            if mac.startswith(("ff:ff:ff:", "01:00:5e", "33:33:", "01:52:0c")):
+                continue
+            ip = f[3]
+            host = f[4] or ""
+            sni = f[5] or ""
+            info = "\t".join(f[6:])
+            if not host:
+                m = re.search(r"([A-Za-z0-9_-]{1,63})\.local", info)
+                host = m.group(1).lower() if m else ""
+            self._contact(mac, ip, host, sni, now)
+
+    def _contact(self, mac, ip, host, sni, now):
+        new = mac not in self.contacts
+        rec = self.contacts.setdefault(mac, {"mac": mac})
+        changed = new
+        rec["t"] = now
+        if ip and ip != "0.0.0.0" and ip != rec.get("ip"):
+            rec["ip"] = ip
+            changed = True
+        if host and host != rec.get("host"):
+            rec["host"] = host
+            changed = True
+        rec["vendor"] = rec.get("vendor") or self._oui(mac)
+        snis = rec.setdefault("sni", {})
+        if sni and sni not in snis:
+            snis[sni] = 0
+            changed = True
+        if sni:
+            snis[sni] += 1
+        if changed:
+            self._save(self.contacts, self.contacts_f)
+            self.icount.setText(f"contacts {len(self.contacts)}")
+            who = mac
+            if rec.get("host"):
+                who += f" ({rec['host']})"
+            who += f" [{rec.get('vendor')}]".rstrip() if rec.get("vendor") else ""
+            extra = f"  {sni} sni" if sni else ""
+            self.speak(f"CONTACT {now}  {who}  {'ip ' + rec['ip'] if rec.get('ip') else ''}{extra}", NEON if new else NEON2)
+
+    # --- media canary -----------------------------------------------------
+    def _media_poll(self):
+        try:
+            out = subprocess.run(
+                ["lsblk", "-p", "-n", "-o", "NAME,UUID,MODEL,SERIAL,FSTYPE"],
+                capture_output=True, text=True, timeout=6,
+            ).stdout
+        except Exception:
+            return
+        devs = {}
+        for line in out.splitlines():
+            p = line.split()
+            if len(p) < 5 or not p[0].startswith("/dev/"):
+                continue
+            devs[p[0]] = {"uuid": p[1], "model": p[2], "serial": p[3], "fstype": p[4]}
+        mounts = {}
+        try:
+            with open("/proc/mounts") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 2:
+                        continue
+                    dev, mp = parts[0], parts[1]
+                    if mp.startswith(str(self.mount_root)) or mp.startswith("/run/media/") or mp.startswith("/media/"):
+                        mounts[dev] = mp
+        except Exception:
+            return
+        media = self.dyed.setdefault("media", {})
+        for dev, mp in mounts.items():
+            meta = devs.get(dev)
+            if not meta or not meta.get("uuid"):
+                continue
+            key = meta["uuid"]
+            entry = media.get(key)
+            if entry is None:
+                self._plant_dye(Path(mp), meta, key)
+            else:
+                self._verify_dye(Path(mp), entry)
+
+    def _plant_dye(self, mp, meta, key, tag=None):
+        token = os.urandom(8).hex()
+        stamp = {"vendor_token": token, "addressed_to": tag or "this lab laptop",
+                 "dyed_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+        try:
+            (mp / f".{token}.raven-dye").write_text(json.dumps(stamp))
+            body = dict(stamp)
+            body["media"] = {"uuid": key, "model": meta.get("model", ""), "serial": meta.get("serial", "")}
+            (mp / ".raven-dye-manifest.json").write_text(json.dumps(body))
+            self.dyed["media"][key] = {
+                "t": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "token": token,
+                "model": meta.get("model", ""),
+                "serial": meta.get("serial", ""),
+                "tag": tag or "this lab laptop",
+            }
+            self._save(self.dyed, self.dyed_f)
+            who = meta.get("model") or Path(mp).name
+            self.speak(f"DYE INJECTED — media '{who}' (uuid {key}) stamped with canary {token[:6]}…", SEV_CRIT)
+        except OSError as e:
+            self.speak(f"dye: could not stamp {mp}: {e}", SEV_MED)
+
+    def _verify_dye(self, mp, entry):
+        token = entry.get("token")
+        present = bool(token) and (mp / f".{token}.raven-dye").exists()
+        if entry.get("fired"):
+            return
+        entry["fired"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        self._save(self.dyed, self.dyed_f)
+        who = entry.get("model") or entry.get("serial") or Path(mp).name
+        if present:
+            self.speak(f"DYE ACTIVATED — identified media returned: '{who}' (serial {entry.get('serial', '?')}, "
+                       f"mounted at {mp})", SEV_CRIT)
+        else:
+            self.speak(f"dye: media '{who}' matches a dyed record but its canary is missing", SEV_MED)
+
+    def dye_drop(self):
+        dp = self.dir / "drop"
+        dp.mkdir(exist_ok=True)
+        self._plant_dye(dp, {"uuid": "drop-folder", "model": "DYE DROP FOLDER", "serial": ""}, "drop-folder")
+
+    # --- authority report -------------------------------------------------
+    def export_report(self):
+        path = self.dir / "CONTACT_REPORT.txt"
+        lines = []
+        lines.append("RAVEN CONTACT/DYE REPORT")
+        lines.append(f"generated {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append("engine: passive l2/l3 observation of this laptop's own interfaces +")
+        lines.append("canary stamps planted on removable media this laptop touched.")
+        lines.append("")
+        lines.append(f"CONTACTS ({len(self.contacts)})")
+        lines.append("-" * 60)
+        for mac, rec in sorted(self.contacts.items()):
+            host = rec.get("host", "")
+            ipv = rec.get("ip", "")
+            vend = rec.get("vendor", "")
+            snis = ", ".join(sorted(rec.get("sni", {}))[:6]) or "-"
+            lines.append(f"{mac}  {vend}  {host}  {ipv}  tls-> {snis}  first@ {rec.get('t', '')}")
+        lines.append("")
+        lines.append(f"DYE MATERIAL ({len(self.dyed.get('media', {}))})")
+        lines.append("-" * 60)
+        for key, rec in sorted(self.dyed.get("media", {}).items()):
+            lines.append(f"uuid {key}  {rec.get('model', '')}  serial {rec.get('serial', '')}  "
+                         f"canary {rec.get('token', '')}  stamped {rec.get('t', '')}  fired {rec.get('fired', '-')}")
+        try:
+            path.write_text("\n".join(lines))
+            self.speak(f"report written: {path}", SEV_CRIT)
+            return str(path)
+        except OSError as e:
+            self.speak(f"report failed: {e}", SEV_CRIT)
+            return None
+
+
 class Raven(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -5037,6 +5364,13 @@ class Raven(QMainWindow):
         crow_scroll.setWidget(self.crow)
         crow.add(crow_scroll)
         self.tabs.addTab(crow, "Crow")
+
+        # Dye — contact forensics + media canary
+        dye = Panel("DYE", "attribution evidence // every device that reaches this laptop, "
+                           "and identifying stamps on media it touched")
+        self.dye = DyePane(self.log, self.report)
+        dye.add(self.dye)
+        self.tabs.addTab(dye, "Dye")
 
         # Lifeline — the unconscious twin (was: Scan)
         lifeline = Panel("LIFELINE", "unconscious twin // never offline, at any cost")
