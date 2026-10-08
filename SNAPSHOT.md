@@ -198,9 +198,40 @@ FINDINGS chips row under each crow = raw IPs/domains from output, click to copy
   The pane facts line shows the live probe: `ping 1.1.1.1 → 43.3 ms ✓`.
   Fixed 2026-10-08: `panic` was never cleared, so one click made the twin
   hard-bounce wlan0 every beat forever.
-- **Edit rule:** the guardian reverts app.py/ravenheart.py/SNAPSHOT.md to the
-  twin's boot-time copy — kill all raven/twin procs **and** `rm -rf
-  /tmp/ravenheart` before editing, otherwise your edit disappears in 2s.
+
+## Survival mode — the extra layer (SURVIVAL ARM / STAND DOWN / SHUTDOWN)
+
+- **Why:** killing every raven process, then editing the files, was a real hack
+  (it's how edits got in). Survival mode is the answer: three buttons in a row
+  of their own on the Lifeline pane — `SURVIVAL ARM`, `SURVIVAL STAND DOWN`,
+  `SHUTDOWN`.
+- **ARM seals everything:** `sudo -n chattr +i` on `app.py`, `ravenheart.py`,
+  `SNAPSHOT.md`, `~/.ssh/authorized_keys` and every file in `~/.ravenheart/`
+  (ledger excluded so it stays appendable) → the edit itself now fails with
+  EPERM. A `manifest.json` of sha256s is sealed in `~/.ravenheart/`.
+- **Second heart:** a `--watchdog` process (own argv) that rebuilds
+  `/tmp/ravenheart` if wiped, restores `control.json` from the
+  `~/.ravenheart` mirror, re-asserts `survival: true` if someone rewrote it,
+  and pulls the twin back within ~1.5s. One heart only — a second copy exits.
+- **systemd is the unkillable part:** the heart is a transient user unit
+  `raven-heart` (`systemd-run --user`, `Restart=on-failure`, `RestartSec=1`):
+  SIGKILL counts as a failure, so systemd brings it back in ~1s, and it brings
+  the twin back with it. Killing *everything* at once buys an attacker ~1–2s,
+  not a takeover. Manual `spawn()` of the heart is only the fallback when
+  systemd isn't there.
+- **Policy is pinned:** `survival` lives in the `~/.ravenheart` mirror (truth);
+  a rewritten `control.json` with `survival: false` is forced back on every
+  beat, and all the arming switches (guard/auto/resurrect/aggressive) are
+  forced true. The GUI refuses to untick them while armed.
+- **Rollback:** with survival on, `integrity_boot()` trusts the sealed
+  manifest instead of the live file — so even an attacker who `chattr -i`s
+  and edits while everything is dead gets their edit rolled back (and the file
+  re-frozen) the moment the twin returns.
+- **SHUTDOWN refuses while armed** — stand down first, then it kills the
+  unit, the heart, the twin and quits Raven. That is the honest off switch.
+- **Edit rule (updated):** to change Raven code you must stand survival down
+  (or never arm it), kill all raven/twin procs and `rm -rf /tmp/ravenheart`
+  plus `rm -rf ~/.ravenheart`; otherwise your edit is reverted within 2s.
 
 ## Big brother — the guardian mode (inside the same twin)
 
@@ -235,7 +266,8 @@ FINDINGS chips row under each crow = raw IPs/domains from output, click to copy
   (operator owns their shell). Backups refreshed hourly. **The sync snapshot is
   taken at twin boot** — so the guardian reverts any mid-session edits of
   app.py/SNAPSHOT.md to the *boot-time* copy: before editing Raven code, kill all
-  raven/twin processes **and** `rm -rf /tmp/ravenheart`, then restart.
+  raven/twin processes **and** `rm -rf /tmp/ravenheart ~/.ravenheart`, then
+  restart (and stand survival down first if it's armed — see the edit rule).
 - **Resurrect reflexes:** murdered app relaunched within ~12s of absence;
   opencode engine (`~/.opencode/bin/opencode web`) within ~20s if the control
   flag is on — killing the mother ship does not take the lab down.
