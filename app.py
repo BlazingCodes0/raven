@@ -1,4 +1,5 @@
 import html
+import hashlib
 import ipaddress
 import json
 import os
@@ -5278,6 +5279,355 @@ class DyePane(QWidget):
             return None
 
 
+class ShieldPane(QWidget):
+    """SHIELD — live self-defense monitor.
+
+    Watches THIS laptop for the classic ways eyes get in or in-between:
+    arp-spoofing / MITM, evil-twin access points, microphone & camera grabs,
+    new network listeners (drops / keylog beacons), and new autostart
+    persistence or tampering with the raven code itself. Everything is local
+    to this machine; alarms land on the event feed.
+    """
+
+    def __init__(self, log, report):
+        super().__init__()
+        self.log = log
+        self.report = report
+        self.dir = ROOT / "shield"
+        self.dir.mkdir(exist_ok=True)
+        self.base_f = self.dir / "baseline.json"
+        self.report_f = self.dir / "SHIELD_REPORT.txt"
+        self.baseline = self._load(self.base_f)
+        self.armed = False
+        self.t0 = 0.0
+        self.alarms = 0
+        self._last = {}
+        self.conn_ssid = ""
+        self.conn_bssid = ""
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.status = QLabel("shield down")
+        self.status.setStyleSheet(f"color: {MUTED}; font-size: 12px;")
+        row.addWidget(self.status)
+        row.addStretch(1)
+        self.btn_arm = QPushButton("ARM SHIELD")
+        self.btn_arm.clicked.connect(self.arm)
+        row.addWidget(self.btn_arm)
+        self.btn_export = QPushButton("EXPORT REPORT")
+        self.btn_export.clicked.connect(self.export_report)
+        row.addWidget(self.btn_export)
+        lay.addLayout(row)
+
+        self.view = QPlainTextEdit()
+        self.view.setReadOnly(True)
+        self.view.document().setMaximumBlockCount(3000)
+        lay.addWidget(self.view)
+
+        self.tick = QTimer(self)
+        self.tick.timeout.connect(self._poll)
+        self.tick.start(4000)
+        self.speak("shield awaits — ARM to baseline your neighbours, network, listeners, autostart and code", SEV_INFO)
+
+    # --- basics -----------------------------------------------------------
+    def _load(self, path):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _save(self, data, path):
+        try:
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, indent=1, sort_keys=True))
+            tmp.replace(path)
+        except Exception:
+            pass
+
+    def speak(self, line, color=None):
+        if color:
+            self.view.appendHtml(f'<span style="color:{color};">{html.escape(line)}</span>')
+        else:
+            self.view.appendPlainText(line)
+        self.log("[shield] " + line)
+
+    def _alarm(self, msg):
+        self.alarms += 1
+        self.speak(msg, SEV_CRIT)
+        self.report("SHIELD ALARM — " + msg)
+        self._save(self.baseline, self.base_f)
+
+    def _dedupe(self, key, msg, window=45):
+        t = time.time()
+        prev = self._last.get(key)
+        if prev and prev[0] == msg and t - prev[1] < window:
+            return True
+        self._last[key] = (msg, t)
+        return False
+
+    # --- collectors -------------------------------------------------------
+    def _neigh(self):
+        try:
+            out = subprocess.run(["ip", "neigh", "show"], capture_output=True, text=True, timeout=4).stdout
+        except Exception:
+            return {}
+        pairs = {}
+        for m in re.finditer(r"(\d+\.\d+\.\d+\.\d+) +dev +(\S+) +lladdr +([\da-f:]{17})", out):
+            mac = m.group(3).lower()
+            pairs[m.group(1)] = mac
+        return pairs
+
+    def _gateway(self):
+        try:
+            out = subprocess.run(["ip", "route", "show", "default"], capture_output=True, text=True, timeout=4).stdout
+            m = re.search(r"via (\d+\.\d+\.\d+\.\d+)", out)
+            return m.group(1) if m else None
+        except Exception:
+            return None
+
+    def _aps(self):
+        try:
+            out = subprocess.run(
+                ["nmcli", "-t", "-e", "no", "-f", "IN-USE,BSSID,SSID,SIGNAL", "dev", "wifi", "list"],
+                capture_output=True, text=True, timeout=6,
+            ).stdout
+        except Exception:
+            return []
+        aps = []
+        for line in out.splitlines():
+            p = line.replace("\\:", "\x1f").split(":")
+            if len(p) < 4:
+                continue
+            use, bssid, ssid, sig = p[0], p[1].lower(), p[2], p[3]
+            if use == "*" and bssid:
+                self.conn_bssid = bssid
+            if use == "*" and ssid:
+                self.conn_ssid = ssid
+            if ssid:
+                aps.append({"bssid": bssid, "ssid": ssid, "signal": sig, "inuse": use == "*"})
+        return aps
+
+    def _link(self):
+        try:
+            out = subprocess.run(["iw", "dev", default_iface(), "link"], capture_output=True, text=True, timeout=4).stdout
+        except Exception:
+            return self.conn_ssid, self.conn_bssid
+        ssid = re.search(r"SSID: *(.+)", out)
+        bssid = re.search(r"Connected to ([\da-f:]{17})", out)
+        return (ssid.group(1).strip() if ssid else self.conn_ssid,
+                bssid.group(1).lower() if bssid else self.conn_bssid)
+
+    def _listeners(self):
+        try:
+            out = subprocess.run(["ss", "-tulpn", "--numeric"], capture_output=True, text=True, timeout=4).stdout
+        except Exception:
+            return []
+        lst = []
+        for line in out.splitlines()[1:]:
+            f = line.split()
+            if len(f) < 5:
+                continue
+            local = f[3]
+            if ":" not in local:
+                continue
+            addr, port = local.rsplit(":", 1)
+            m = re.search(r'users:\(\("([^"]*)"', line)
+            proc = m.group(1) if m else "?"
+            lst.append((f[0], addr, port, proc))
+        return lst
+
+    def _autostart_files(self):
+        files = set()
+        for d in (Path.home() / ".config" / "autostart", Path("/etc/xdg/autostart")):
+            try:
+                files |= {p.name for p in d.iterdir() if p.is_file()}
+            except Exception:
+                pass
+        return files
+
+    def _mic_clients(self):
+        try:
+            out = subprocess.run(["pactl", "list", "short", "source-outputs"], capture_output=True, text=True, timeout=4).stdout
+            return [l for l in out.splitlines() if l.strip()]
+        except Exception:
+            return []
+
+    def _cam_pids(self):
+        pids = set()
+        for dev in sorted(Path("/dev").glob("video[0-9]*")):
+            try:
+                r = subprocess.run(["fuser", str(dev)], capture_output=True, text=True, timeout=4)
+                if r.stdout:
+                    pids.update(r.stdout.split())
+            except Exception:
+                pass
+        return pids
+
+    def _hash(self, path):
+        try:
+            return hashlib.sha1(Path(path).read_bytes()).hexdigest()
+        except Exception:
+            return ""
+
+    # --- arm / poll -------------------------------------------------------
+    def arm(self):
+        self.baseline = {}
+        self.baseline["at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        self.baseline["neigh"] = self._neigh()
+        self.baseline["gateway"] = self._gateway()
+        self.baseline["aps"] = self._aps()
+        self.conn_ssid, self.conn_bssid = self._link()
+        self.baseline["conn_ssid"] = self.conn_ssid
+        self.baseline["conn_bssid"] = self.conn_bssid
+        self.baseline["listeners"] = self._listeners()
+        self.baseline["autostart"] = sorted(self._autostart_files())
+        self.baseline["code"] = {
+            "app.py": self._hash(ROOT / "app.py"),
+            "ravenheart.py": self._hash(ROOT / "ravenheart.py"),
+            "SNAPSHOT.md": self._hash(ROOT / "SNAPSHOT.md"),
+        }
+        self._save(self.baseline, self.base_f)
+        self.armed = True
+        self.t0 = time.time()
+        self._last.clear()
+        self.alarms = 0
+        self.btn_arm.setText("SHIELD ARMED · RE-ARM re-baselines")
+        self.status.setText(f"shield up · neighbours {len(self.baseline['neigh'])} · "
+                            f"listeners {len(self.baseline['listeners'])}")
+        self.speak("SHIELD ARMED — baseline captured"
+                   f" (gateway {self.baseline.get('gateway')}, ssid {self.conn_ssid or '-'},"
+                   f" {len(self.baseline['listeners'])} listeners, autostart {len(self.baseline['autostart'])})", SEV_INFO)
+
+    def _learning(self):
+        return time.time() - self.t0 < 8
+
+    def _poll(self):
+        if not self.armed:
+            return
+        self._arp_check(self._neigh(), self.baseline.get("neigh", {}), self.baseline.get("gateway"))
+        self.conn_ssid, self.conn_bssid = self._link()
+        self._ap_check(self._aps(), self.baseline.get("aps", []))
+        self._listen_check(self._listeners(), self.baseline.get("listeners", []))
+        self._persist_check(self._autostart_files(), self.baseline.get("autostart", []))
+        self._code_check({
+            "app.py": self._hash(ROOT / "app.py"),
+            "ravenheart.py": self._hash(ROOT / "ravenheart.py"),
+            "SNAPSHOT.md": self._hash(ROOT / "SNAPSHOT.md"),
+        }, self.baseline.get("code", {}))
+        if not self._learning():
+            self._sense_check(self._mic_clients(), self._cam_pids())
+        if not self._learning():
+            self.status.setText(f"shield up · neighbours {len(self.baseline.get('neigh', {}))} · alarms {self.alarms}")
+
+    # --- checks -----------------------------------------------------------
+    def _arp_check(self, neigh, baseline, gw):
+        if self._learning():
+            for ip, mac in neigh.items():
+                baseline[ip] = mac
+            return
+        for ip, mac in neigh.items():
+            old = baseline.get(ip)
+            if old is None:
+                baseline[ip] = mac
+                continue
+            if old != mac:
+                where = f" (gateway {gw})" if ip == gw else ""
+                msg = f"ARP MITM SUSPECT — {ip} resolved {old} -> {mac}{where}"
+                if not self._dedupe("arp:" + ip + mac, msg):
+                    self._alarm(msg)
+                baseline[ip] = mac
+        if gw and gw in baseline and gw not in neigh:
+            msg = f"gateway {gw} disappeared from neighbour table"
+            if not self._dedupe("arp:gone:" + gw, msg):
+                self._alarm(msg)
+
+    def _ap_check(self, aps, baseline_aps):
+        base_ssids = {a["ssid"] for a in baseline_aps}
+        if self.baseline.get("conn_ssid"):
+            base_ssids.add(self.baseline["conn_ssid"])
+        if self._learning():
+            for a in aps:
+                if not any(b["bssid"] == a["bssid"] for b in baseline_aps):
+                    baseline_aps.append(a)
+            return
+        for a in aps:
+            if a["inuse"] and a["bssid"] != self.baseline.get("conn_bssid"):
+                msg = f"SEEN ROAMING/PREEMPTED — now associated to {a['bssid']} (was {self.baseline.get('conn_bssid')})"
+                if not self._dedupe("ap:roam:" + a["bssid"], msg):
+                    self._alarm(msg)
+            if a["ssid"] in base_ssids and not any(b["bssid"] == a["bssid"] for b in baseline_aps):
+                msg = f"EVIL TWIN SIGNAL — another radio is broadcasting your net '{a['ssid']}' at {a['bssid']} (signal {a['signal']})"
+                if not self._dedupe("ap:twin:" + a["ssid"], msg):
+                    self._alarm(msg)
+                    baseline_aps.append(a)
+
+    def _listen_check(self, listeners, baseline_l):
+        base = {(proto, port) for (proto, addr, port, proc) in baseline_l}
+        if self._learning():
+            return
+        for (proto, addr, port, proc) in listeners:
+            if (proto, port) in base:
+                continue
+            if addr in ("127.0.0.1", "::1", "127.0.0.53", "0.0.0.0", "::") or addr.startswith("127."):
+                continue
+            msg = f"NEW LISTENER — {proto} {addr}:{port} ({proc})"
+            if not self._dedupe("listen:" + port, msg):
+                self._alarm(msg)
+
+    def _persist_check(self, files, base):
+        base_set = set(base)
+        if self._learning():
+            return
+        for name in sorted(files - base_set):
+            msg = f"NEW AUTOSTART PERSISTENCE — {name}"
+            if not self._dedupe("autostart:" + name, msg):
+                self._alarm(msg)
+
+    def _code_check(self, now, base):
+        for name, h in now.items():
+            b = base.get(name)
+            if b is not None and b != h:
+                msg = f"CODE TAMPER — {name} changed after arm (re-arm to bless your own edits)"
+                if not self._dedupe("code:" + name, msg):
+                    self._alarm(msg)
+
+    def _sense_check(self, mic, cam):
+        if mic:
+            msg = f"MICROPHONE GRAB — {len(mic)} recording client(s) active"
+            if not self._dedupe("mic", msg):
+                self._alarm(msg)
+        if cam:
+            msg = f"WEBCAM OPEN — process(es) {', '.join(sorted(cam))} hold /dev/video"
+            if not self._dedupe("cam:" + ",".join(sorted(cam)), msg):
+                self._alarm(msg)
+
+    # --- report -----------------------------------------------------------
+    def export_report(self):
+        lines = ["RAVEN SHIELD REPORT", f"armed {self.baseline.get('at', '-')}  alarms fired {self.alarms}",
+                 f"gateway {self.baseline.get('gateway')}  connected ssid {self.baseline.get('conn_ssid')} "
+                 f"bssid {self.baseline.get('conn_bssid')}", "", "NEIGHBOUR MAP (ip -> mac)"]
+        for ip, mac in sorted(self.baseline.get("neigh", {}).items()):
+            lines.append(f"  {ip}  {mac}")
+        lines.append("")
+        lines.append("PUBLIC LISTENERS")
+        for (proto, addr, port, proc) in self.baseline.get("listeners", []):
+            if addr not in ("127.0.0.1", "::1", "0.0.0.0", "::") and not addr.startswith("127."):
+                lines.append(f"  {proto} {addr}:{port}  ({proc})")
+        try:
+            self._save(self.baseline, self.base_f)
+            path = self.report_f
+            path.write_text("\n".join(lines))
+            self.speak(f"report written: {path}", SEV_CRIT)
+            return str(path)
+        except OSError as e:
+            self.speak(f"report failed: {e}", SEV_CRIT)
+            return None
+
+
 class Raven(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -5371,6 +5721,12 @@ class Raven(QMainWindow):
         self.dye = DyePane(self.log, self.report)
         dye.add(self.dye)
         self.tabs.addTab(dye, "Dye")
+
+        # Shield — live self-defense monitor
+        shield = Panel("SHIELD", "self-defense // catches the eyes trying to get in or in-between")
+        self.shield = ShieldPane(self.log, self.report)
+        shield.add(self.shield)
+        self.tabs.addTab(shield, "Shield")
 
         # Lifeline — the unconscious twin (was: Scan)
         lifeline = Panel("LIFELINE", "unconscious twin // never offline, at any cost")
