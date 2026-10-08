@@ -16,6 +16,7 @@ from PyQt6.QtGui import QBrush, QColor, QIcon, QFont, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -42,6 +43,7 @@ TEXT = "#d4d4d4"
 MUTED = "#6b6b6b"
 NEON = "#00e5ff"
 NEON2 = "#a855f7"
+CRIMSON = "#e0115f"      # vampire-finch blood
 
 SEV_INFO = "#58a6ff"   # watch / baseline
 SEV_LOW = "#3fb950"    # low
@@ -2559,6 +2561,25 @@ def default_iface():
     except Exception:
         pass
     return "wlan0"
+
+
+def nmcli_tokens(line):
+    """Split one `nmcli -t` row on unescaped ':' and decode \\: escapes."""
+    toks, cur, i = [], [], 0
+    while i < len(line):
+        ch = line[i]
+        if ch == "\\" and i + 1 < len(line):
+            cur.append(line[i + 1])
+            i += 2
+        elif ch == ":":
+            toks.append("".join(cur))
+            cur = []
+            i += 1
+        else:
+            cur.append(ch)
+            i += 1
+    toks.append("".join(cur))
+    return toks
 
 
 def local_subnet():
@@ -5401,14 +5422,14 @@ class ShieldPane(QWidget):
     def _aps(self):
         try:
             out = subprocess.run(
-                ["nmcli", "-t", "-e", "no", "-f", "IN-USE,BSSID,SSID,SIGNAL", "dev", "wifi", "list"],
+                ["nmcli", "-t", "-f", "IN-USE,BSSID,SSID,SIGNAL", "dev", "wifi", "list"],
                 capture_output=True, text=True, timeout=6,
             ).stdout
         except Exception:
             return []
         aps = []
         for line in out.splitlines():
-            p = line.replace("\\:", "\x1f").split(":")
+            p = nmcli_tokens(line)
             if len(p) < 4:
                 continue
             use, bssid, ssid, sig = p[0], p[1].lower(), p[2], p[3]
@@ -5637,6 +5658,395 @@ class ShieldPane(QWidget):
             return None
 
 
+class FinchPane(QWidget):
+    """FINCH — the vampire finch.
+
+    SHIELD reports; FINCH bites back. Three postures, all bounded and local to
+    this machine:
+      HARVEST — watch only, log what a bite WOULD have done.
+      PECK    — heal our own stuff: restore poisoned ARP neighbours,
+                quarantine rogue autostart, git-restore tampered raven code.
+      BITE    — everything in PECK, plus drop webcam grabbers and surge back
+                onto the trusted access point when an evil twin preempts us.
+    Every action lands on the ledger and is reversible / documented.
+    """
+
+    POSTURES = ["HARVEST", "PECK", "BITE"]
+
+    def __init__(self, log, report):
+        super().__init__()
+        self.log = log
+        self.report = report
+        self.dir = ROOT / "finch"
+        self.dir.mkdir(exist_ok=True)
+        self.qdir = self.dir / "quarantine"
+        self.qdir.mkdir(exist_ok=True)
+        self.base_f = self.dir / "baseline.json"
+        self.wl_f = self.dir / "whitelist.json"
+        self.ledger_f = self.dir / "BITE_REPORT.txt"
+        self.baseline = self._load(self.base_f)
+        self.whitelist = self._load(self.wl_f)
+        self.posture = "HARVEST"
+        self.bites = 0
+        self.armed = False
+        self.t0 = 0.0
+        self._seen = {}
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.status = QLabel("finch sleeps — nothing bites")
+        self.status.setStyleSheet(f"color: {MUTED}; font-size: 12px;")
+        row.addWidget(self.status)
+        row.addStretch(1)
+        self.posture_box = QComboBox()
+        self.posture_box.addItems(self.POSTURES)
+        self.posture_box.setToolTip("HARVEST=watch only · PECK=heal own gear · BITE=active bite-back")
+        self.posture_box.currentTextChanged.connect(self._set_posture)
+        row.addWidget(self.posture_box)
+        self.btn_arm = QPushButton("ARM FINCH")
+        self.btn_arm.clicked.connect(self.arm)
+        row.addWidget(self.btn_arm)
+        self.btn_bless = QPushButton("SAVE WHITELIST")
+        self.btn_bless.clicked.connect(self.bless_whitelist)
+        row.addWidget(self.btn_bless)
+        self.btn_export = QPushButton("EXPORT BITE LOG")
+        self.btn_export.clicked.connect(self.export_ledger)
+        row.addWidget(self.btn_export)
+        lay.addLayout(row)
+
+        self.view = QPlainTextEdit()
+        self.view.setReadOnly(True)
+        self.view.document().setMaximumBlockCount(1500)
+        lay.addWidget(self.view)
+
+        self.tick = QTimer(self)
+        self.tick.timeout.connect(self._poll)
+        self.tick.start(4000)
+        self.speak("the vampire finch wakes with you — ARM to baseline the net, then pick a posture: "
+                   "HARVEST watches, PECK heals your own gear, BITE bites back",
+                   CRIMSON)
+
+    # --- basics -----------------------------------------------------------
+    def _load(self, path):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _save(self, data, path):
+        try:
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, indent=1, sort_keys=True))
+            tmp.replace(path)
+        except Exception:
+            pass
+
+    def speak(self, line, color=None, sev=False):
+        c = color if color else MUTED
+        self.view.appendHtml(f'<span style="color:{c};">{html.escape(line)}</span>')
+        self.log("[finch] " + line)
+
+    def _bite(self, msg, action=None):
+        self.bites += 1
+        self.speak(msg, CRIMSON)
+        self.report("FINCH BITE — " + msg)
+        if action:
+            self._ledger.append(action)
+
+    def _dedupe(self, key, window=60):
+        t = time.time()
+        prev = self._seen.get(key)
+        if prev and t - prev < window:
+            return True
+        self._seen[key] = t
+        return False
+
+    def _run(self, argv):
+        try:
+            return subprocess.run(argv, capture_output=True, text=True, timeout=5)
+        except Exception as e:
+            return None
+
+    def _proc_name(self, pid):
+        try:
+            return (Path("/proc") / str(pid) / "comm").read_text().strip()
+        except Exception:
+            return ""
+
+    # --- collectors (mirror shield, independent baseline) -----------------
+    def _neigh(self):
+        try:
+            out = subprocess.run(["ip", "neigh", "show"], capture_output=True, text=True, timeout=4).stdout
+        except Exception:
+            return {}
+        pairs = {}
+        for m in re.finditer(r"(\d+\.\d+\.\d+\.\d+) +dev +(\S+) +lladdr +([\da-f:]{17})", out):
+            pairs[m.group(1)] = m.group(3).lower()
+        return pairs
+
+    def _linkdev(self):
+        try:
+            out = subprocess.run(["ip", "route", "show", "default"], capture_output=True, text=True, timeout=4).stdout
+            m = re.search(r"dev +(\S+)", out)
+            return m.group(1) if m else "wlan0"
+        except Exception:
+            return "wlan0"
+
+    def _aps(self):
+        try:
+            out = subprocess.run(
+                ["nmcli", "-t", "-f", "IN-USE,BSSID,SSID", "dev", "wifi", "list"],
+                capture_output=True, text=True, timeout=6,
+            ).stdout
+        except Exception:
+            return []
+        aps = []
+        for line in out.splitlines():
+            p = nmcli_tokens(line)
+            if len(p) < 3:
+                continue
+            use, bssid, ssid = p[0], p[1].lower(), p[2]
+            if use == "*" and bssid and ssid:
+                aps.append({"bssid": bssid, "ssid": ssid, "inuse": True})
+        return aps
+
+    def _link(self):
+        try:
+            out = subprocess.run(["iw", "dev", default_iface(), "link"], capture_output=True, text=True, timeout=4).stdout
+        except Exception:
+            return None, None
+        ssid = re.search(r"SSID: *(.+)", out)
+        bssid = re.search(r"Connected to ([\da-f:]{17})", out)
+        return (ssid.group(1).strip() if ssid else None,
+                bssid.group(1).lower() if bssid else None)
+
+    def _autostart_files(self):
+        files = set()
+        for d in (Path.home() / ".config" / "autostart", Path("/etc/xdg/autostart")):
+            try:
+                files |= {p.name for p in d.iterdir() if p.is_file()}
+            except Exception:
+                pass
+        return files
+
+    def _mic_clients(self):
+        try:
+            out = subprocess.run(["pactl", "list", "short", "source-outputs"], capture_output=True, text=True, timeout=4).stdout
+            return [l for l in out.splitlines() if l.strip()]
+        except Exception:
+            return []
+
+    def _cam_pids(self):
+        pids = set()
+        for dev in sorted(Path("/dev").glob("video[0-9]*")):
+            try:
+                r = subprocess.run(["fuser", str(dev)], capture_output=True, text=True, timeout=4)
+                if r.stdout:
+                    pids.update(r.stdout.split())
+            except Exception:
+                pass
+        return pids
+
+    def _hash(self, path):
+        try:
+            return hashlib.sha1(Path(path).read_bytes()).hexdigest()
+        except Exception:
+            return ""
+
+    # --- arm / whitelist --------------------------------------------------
+    def arm(self):
+        aps = self._aps()
+        iw_ssid, iw_bssid = self._link()
+        conn = next((a for a in aps if a["inuse"]), None)
+        if not conn and iw_bssid:
+            conn = {"bssid": iw_bssid, "ssid": iw_ssid or "?", "inuse": True}
+        self.baseline = {
+            "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "neigh": self._neigh(),
+            "dev": self._linkdev(),
+            "conn": conn or {},
+            "autostart": sorted(self._autostart_files()),
+            "code": {
+                "app.py": self._hash(ROOT / "app.py"),
+                "ravenheart.py": self._hash(ROOT / "ravenheart.py"),
+                "SNAPSHOT.md": self._hash(ROOT / "SNAPSHOT.md"),
+            },
+        }
+        self._save(self.baseline, self.base_f)
+        self.armed = True
+        self.t0 = time.time()
+        self._seen.clear()
+        self.bites = 0
+        self.btn_arm.setText("FINCH ARMED · RE-ARM re-baselines")
+        self.status.setText(f"{self.posture} · bites {self.bites}")
+        self.speak("FINCH ARMED — baseline captured"
+                   f" (neigh {len(self.baseline['neigh'])}, dev {self.baseline['dev']}),"
+                   f" posture {self.posture}. learning window 8s.",
+                   CRIMSON)
+
+    def _set_posture(self, p):
+        if p not in self.POSTURES:
+            return
+        self.posture = p
+        self.status.setText(f"{p} · bites {self.bites}")
+        mode = {
+            "HARVEST": "watch only, no mutations",
+            "PECK": "heal own gear (arp-restore, quarantine rogue autostart, git-restore tamper)",
+            "BITE": "active bite-back live (PECK + drop webcam grabbers + surge to trusted ap)",
+        }[p]
+        self.speak(f"posture → {p} — {mode}", CRIMSON)
+
+    def bless_whitelist(self):
+        self.whitelist = {
+            "autostart": sorted(self._autostart_files()),
+            "grabs": sorted({self._proc_name(p) for p in self._cam_pids()}),
+        }
+        self._save(self.whitelist, self.wl_f)
+        self.speak("whitelist blessed — current autostart + cam holders are trusted", CRIMSON)
+
+    def _learning(self):
+        return time.time() - self.t0 < 8
+
+    # --- bites ------------------------------------------------------------
+    def _poll(self):
+        if not self.armed:
+            return
+        self._ledger = []
+        try:
+            base = self.baseline
+            self._arp_bite(base)
+            self._persist_bite(base)
+            self._code_bite(base)
+            if self.posture in ("PECK", "BITE"):
+                self._twin_bite(base)
+            if self.posture == "BITE":
+                self._grab_bite()
+            self.status.setText(f"{self.posture} · bites {self.bites}")
+        finally:
+            del self._ledger
+
+    def _arp_bite(self, base):
+        neigh = self._neigh()
+        for ip, mac in neigh.items():
+            old = base.get("neigh", {}).get(ip)
+            if old is not None and old != mac:
+                key = f"arp:{ip}:{old}->{mac}"
+                if self._dedupe(key):
+                    continue
+                dev = base.get("dev", "wlan0")
+                action = f"ip neigh replace {ip} lladdr {old} dev {dev}"
+                if self.posture == "HARVEST":
+                    self._bite(f"ARP POISON {ip} → {mac}: WOULD RESTORE {old} on {dev}", None)
+                    continue
+                r = self._run(["ip", "neigh", "replace", ip, "lladdr", old, "dev", dev])
+                ok = "ok" if (r and not r.returncode) else (f"fail {r.returncode if r else '?'}")
+                self._bite(f"ARP POISON — bitten: restored neighbour {ip} → {old} ({ok})", action)
+
+    def _persist_bite(self, base):
+        now = self._autostart_files()
+        banned = set(self.whitelist.get("autostart", []))
+        for name in sorted(now - set(base.get("autostart", [])) - banned):
+            key = "auto:" + name
+            if self._dedupe(key):
+                continue
+            if self.posture == "HARVEST":
+                self._bite(f"NEW AUTOSTART '{name}': WOULD quarantine", None)
+                continue
+            moved = None
+            for d in (Path.home() / ".config" / "autostart", Path("/etc/xdg/autostart")):
+                src = d / name
+                if src.exists():
+                    if d == Path.home() / ".config" / "autostart":
+                        try:
+                            shutil.move(str(src), str(self.qdir / name))
+                            moved = self.qdir / name
+                        except OSError as e:
+                            moved = f"move failed {e}"
+                    else:
+                        self.speak(f"autostart '{name}' lives in {d} (needs root) — left in place", CRIMSON)
+                    break
+            self._bite(f"AUTOSTART '{name}' QUARANTINED → {moved or 'n/a'}", f"mv {src} → {moved}" if moved else name)
+
+    def _code_bite(self, base):
+        for name, h in {"app.py": self._hash(ROOT / "app.py"),
+                        "ravenheart.py": self._hash(ROOT / "ravenheart.py"),
+                        "SNAPSHOT.md": self._hash(ROOT / "SNAPSHOT.md")}.items():
+            b = base.get("code", {}).get(name)
+            if b is not None and b != h:
+                key = "code:" + name
+                if self._dedupe(key):
+                    continue
+                if self.posture == "HARVEST":
+                    self._bite(f"CODE TAMPER {name}: WOULD git-HEAD restore", None)
+                    continue
+                r = self._run(["git", "-C", str(ROOT), "checkout", "--", name])
+                ok = "ok" if (r and not r.returncode) else (f"fail {r.returncode if r else '?'}")
+                self._bite(f"CODE TAMPER {name} — bitten: restored to git HEAD ({ok})",
+                           f"git checkout -- {name}")
+
+    def _twin_bite(self, base):
+        conn = base.get("conn", {})
+        if not conn:
+            return
+        now = self._aps()
+        cur = next((a for a in now if a["inuse"]), None)
+        if cur and cur["bssid"] != conn.get("bssid") and cur["ssid"] == conn.get("ssid"):
+            key = "twin:" + cur["bssid"]
+            if self._dedupe(key):
+                return
+            out = self._run(["nmcli", "-t", "-f", "NAME", "connection", "show", "--active"])
+            prof = (out.stdout.strip().splitlines() or ["?"])[0] if out else "?"
+            if self.posture == "PECK":
+                self._bite(f"PREEMPTED to {cur['bssid']}: would surge back to trusted ap (active '{prof}')", None)
+                return
+            r = self._run(["nmcli", "connection", "up", prof])
+            ok = "surged" if (r and not r.returncode) else f"fail {r.returncode if r else '?'}"
+            self._bite(f"EVIL TWIN PREEMPTED us ({cur['bssid']}) — bitten: {ok}",
+                       f"nmcli connection up {prof}")
+
+    def _grab_bite(self):
+        banned = set(self.whitelist.get("grabs", []))
+        for pid in sorted(self._cam_pids()):
+            name = self._proc_name(pid)
+            key = f"cam:{pid}:{name}"
+            if self._dedupe(key):
+                continue
+            if not name or name in banned:
+                self.speak(f"webcam holder {pid}/{name or '?'} — whitelisted, left alone", MUTED)
+                continue
+            r = self._run(["kill", str(pid)])
+            ok = "dropped" if (r and not r.returncode) else (f"fail {r.returncode if r else '?'}")
+            self._bite(f"WEBCAM GRAB pid {pid}/{name} — bitten: {ok}",
+                       f"kill {pid} ({name})")
+        for line in self._mic_clients():
+            if self._dedupe("mic:" + line):
+                continue
+            app = line.split("\t")[-1] if "\t" in line else line
+            self._bite(f"MIC CLIENT active: {app} — named for the ledger; reassign source to silence", None)
+
+    # --- ledger -----------------------------------------------------------
+    def export_ledger(self):
+        lines = ["RAVEN FINCH — BITE REPORT",
+                 f"posture {self.posture}  baseline {self.baseline.get('at', '-')}  bites {self.bites}",
+                 f"connected {self.baseline.get('conn', {}).get('ssid', '-')} "
+                 f"({self.baseline.get('conn', {}).get('bssid', '-')}) on {self.baseline.get('dev', '-')}", ""]
+        for a in getattr(self, "_ledger", []) or []:
+            lines.append("  " + a)
+        try:
+            self._save(self.baseline, self.base_f)
+            path = self.ledger_f
+            path.write_text("\n".join(lines))
+            self.speak(f"bite log written: {path}", CRIMSON)
+            return str(path)
+        except OSError as e:
+            self.speak(f"bite log failed: {e}", CRIMSON)
+            return None
+
+
 class Raven(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -5665,6 +6075,9 @@ class Raven(QMainWindow):
         sub = QLabel("SECURITY LAB // LOCAL AUTHORIZED TESTING ONLY")
         sub.setObjectName("sub")
         title_box.addWidget(sub)
+        finch_tag = QLabel("finch is on the wing")
+        finch_tag.setStyleSheet(f"color: {CRIMSON}; font-size: 10px; letter-spacing: 1px;")
+        title_box.addWidget(finch_tag)
         hl.addLayout(title_box)
         hl.addStretch(1)
         mode = QLabel("OFFLINE")
@@ -5737,6 +6150,12 @@ class Raven(QMainWindow):
         self.shield = ShieldPane(self.log, self.report)
         shield.add(self.shield)
         self.tabs.addTab(shield, "Shield")
+
+        # Finch — the vampire finch, bites back (posture-gated active defense)
+        finch = Panel("FINCH", "vampire finch // when something bites your network, finch bites back")
+        self.finch = FinchPane(self.log, self.report)
+        finch.add(self.finch)
+        self.tabs.addTab(finch, "Finch")
 
         # Lifeline — the unconscious twin (was: Scan)
         lifeline = Panel("LIFELINE", "unconscious twin // never offline, at any cost")
