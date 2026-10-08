@@ -42,7 +42,8 @@ def beat_state(**kw):
 
 
 def ctl():
-    base = {"auto": True, "guard": True, "aggressive": True, "opencode": True, "threshold": 2}
+    base = {"auto": True, "resurrect": True, "guard": True,
+            "aggressive": True, "opencode": True, "threshold": 2}
     try:
         with open(CONTROL) as f:
             base.update(json.load(f))
@@ -424,31 +425,50 @@ def main():
     ev("LIFE", "unconscious twin + big brother on watch")
     integrity_boot()
     strikes = 0
+    beat = 0
     while True:
         try:
             dev, gw = route()
             c = ctl()
-            heartbeat = online()
+            # AUTO RESURRECT: ping the bearer every beat; armed = ping + fix itself
+            armed = bool(c.get("auto", True)) and bool(c.get("resurrect", True))
+            rtt = rtt_ms()                       # one real ICMP ping, every beat
+            pinged = rtt is not None
+            heartbeat = online() or pinged
             gd = guardian()
             if heartbeat:
+                if strikes:
+                    ev("PING", "bearer is back — 1.1.1.1 answered in %s ms" % rtt)
                 strikes = 0
+                beat += 1
+                if armed and beat % 15 == 0:
+                    ev("PING", "auto resurrect probe: 1.1.1.1 answered in %s ms" % rtt)
                 beat_state(up=True, iface=dev or "", gw=gw or "", strikes=0,
-                           rtt=rtt_ms(), auto=c.get("auto", True), pid=os.getpid(), guard=gd)
+                           rtt=rtt, auto=armed, pid=os.getpid(), guard=gd)
             else:
                 strikes = min(strikes + 1, 6)
                 beat_state(up=False, iface=dev or "", gw=gw or "", strikes=strikes,
-                           auto=c.get("auto", True), pid=os.getpid(), guard=gd)
-                if dev and c.get("auto", True):
-                    heal(dev, strikes)
+                           rtt=None, auto=armed, pid=os.getpid(), guard=gd)
+                if armed:
+                    ev("PING", "no answer from 1.1.1.1/8.8.8.8 — auto resurrect (%d/6)"
+                       % strikes)
+                    if dev:
+                        heal(dev, strikes)
+                    else:
+                        ev("CRIT", "no default route — faint but watching; nothing to bounce")
                 elif not dev:
                     ev("CRIT", "no default route — faint but watching; nothing to bounce")
         except Exception as ex:
             ev("ERR", repr(ex))
         try:
-            if ctl().get("panic"):
+            c = ctl()
+            if c.get("panic"):
                 ev("PANIC", "manual resurrect ordered by the operator")
                 if route()[0]:
                     heal(route()[0], 6)
+                c["panic"] = 0          # one click = one resurrect; consume the flag
+                with open(CONTROL, "w") as f:
+                    json.dump(c, f)
         except Exception:
             pass
         time.sleep(BEAT)

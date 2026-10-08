@@ -3165,7 +3165,8 @@ def beat_state(**kw):
 
 
 def ctl():
-    base = {"auto": True, "guard": True, "aggressive": True, "opencode": True, "threshold": 2}
+    base = {"auto": True, "resurrect": True, "guard": True,
+            "aggressive": True, "opencode": True, "threshold": 2}
     try:
         with open(CONTROL) as f:
             base.update(json.load(f))
@@ -3547,31 +3548,50 @@ def main():
     ev("LIFE", "unconscious twin + big brother on watch")
     integrity_boot()
     strikes = 0
+    beat = 0
     while True:
         try:
             dev, gw = route()
             c = ctl()
-            heartbeat = online()
+            # AUTO RESURRECT: ping the bearer every beat; armed = ping + fix itself
+            armed = bool(c.get("auto", True)) and bool(c.get("resurrect", True))
+            rtt = rtt_ms()                       # one real ICMP ping, every beat
+            pinged = rtt is not None
+            heartbeat = online() or pinged
             gd = guardian()
             if heartbeat:
+                if strikes:
+                    ev("PING", "bearer is back — 1.1.1.1 answered in %s ms" % rtt)
                 strikes = 0
+                beat += 1
+                if armed and beat % 15 == 0:
+                    ev("PING", "auto resurrect probe: 1.1.1.1 answered in %s ms" % rtt)
                 beat_state(up=True, iface=dev or "", gw=gw or "", strikes=0,
-                           rtt=rtt_ms(), auto=c.get("auto", True), pid=os.getpid(), guard=gd)
+                           rtt=rtt, auto=armed, pid=os.getpid(), guard=gd)
             else:
                 strikes = min(strikes + 1, 6)
                 beat_state(up=False, iface=dev or "", gw=gw or "", strikes=strikes,
-                           auto=c.get("auto", True), pid=os.getpid(), guard=gd)
-                if dev and c.get("auto", True):
-                    heal(dev, strikes)
+                           rtt=None, auto=armed, pid=os.getpid(), guard=gd)
+                if armed:
+                    ev("PING", "no answer from 1.1.1.1/8.8.8.8 — auto resurrect (%d/6)"
+                       % strikes)
+                    if dev:
+                        heal(dev, strikes)
+                    else:
+                        ev("CRIT", "no default route — faint but watching; nothing to bounce")
                 elif not dev:
                     ev("CRIT", "no default route — faint but watching; nothing to bounce")
         except Exception as ex:
             ev("ERR", repr(ex))
         try:
-            if ctl().get("panic"):
+            c = ctl()
+            if c.get("panic"):
                 ev("PANIC", "manual resurrect ordered by the operator")
                 if route()[0]:
                     heal(route()[0], 6)
+                c["panic"] = 0          # one click = one resurrect; consume the flag
+                with open(CONTROL, "w") as f:
+                    json.dump(c, f)
         except Exception:
             pass
         time.sleep(BEAT)
@@ -3642,6 +3662,10 @@ class LifelinePane(QWidget):
         )
         self.btn_panic.clicked.connect(self._panic)
         row2.addWidget(self.btn_panic)
+        self.chk_res = QCheckBox("AUTO RESURRECT (pings the network, fixes itself)")
+        self.chk_res.setChecked(True)
+        self.chk_res.toggled.connect(self._arm)
+        row2.addWidget(self.chk_res)
         self.btn_twin = QPushButton("SPAWN TWIN")
         self.btn_twin.setObjectName("ghost")
         self.btn_twin.clicked.connect(self._ensure_twin)
@@ -3667,6 +3691,9 @@ class LifelinePane(QWidget):
             "twin's own snapshot, alerts on dotfile/autostart/systemd-unit changes, and relaunches "
             "the raven app + opencode engine when they're murdered. ROOTLESS it can also rescan/"
             "re-associate wifi and renew leases; with nopasswd sudo it hard-bounces the interface. "
+            "AUTO RESURRECT pings 1.1.1.1 every beat and starts fixing itself the moment the "
+            "answers stop — you'll see PING lines in the ledger; RESURRECT NOW stays a one-shot "
+            "manual order. "
             "HONEST LIMITS: it can't replace a pulled antenna, resurrect a powered-off hotspot, or "
             "see inside encrypted sessions — and its capture-busting treats this account's own "
             "screenshot tools as intruders too (flip AGGRESSIVE off for a demo)."
@@ -3737,7 +3764,7 @@ class LifelinePane(QWidget):
             except Exception:
                 pass
             if not data:  # first boot → resurrect on auto by default
-                data.update({"auto": True, "guard": True,
+                data.update({"auto": True, "resurrect": True, "guard": True,
                              "aggressive": True, "opencode": True, "panic": 0})
             data.update(kw)
             with open(CONTROL_PATH, "w") as f:
@@ -3755,17 +3782,20 @@ class LifelinePane(QWidget):
             self._arm(True)  # no saved choice → resurrect on auto by default
             return
         self.chk_auto.setChecked(bool(c.get("auto", True)))
+        self.chk_res.setChecked(bool(c.get("resurrect", True)))
         self.chk_guard.setChecked(bool(c.get("guard", True)))
         self.chk_agg.setChecked(bool(c.get("aggressive", True)))
         self.chk_oc.setChecked(bool(c.get("opencode", True)))
 
     def _arm(self, on):
         self._control(auto=bool(self.chk_auto.isChecked()),
-                       guard=bool(self.chk_guard.isChecked()),
-                       aggressive=bool(self.chk_agg.isChecked()),
-                       opencode=bool(self.chk_oc.isChecked()))
-        self.log("[twin] auto-heal %s · big brother %s · aggressive %s · respawn %s"
+                      resurrect=bool(self.chk_res.isChecked()),
+                      guard=bool(self.chk_guard.isChecked()),
+                      aggressive=bool(self.chk_agg.isChecked()),
+                      opencode=bool(self.chk_oc.isChecked()))
+        self.log("[twin] auto-heal %s · auto resurrect %s · big brother %s · aggressive %s · respawn %s"
                  % ("on" if self.chk_auto.isChecked() else "off",
+                    "on (ping every 2s)" if self.chk_res.isChecked() else "off",
                     "on" if self.chk_guard.isChecked() else "off",
                     "on" if self.chk_agg.isChecked() else "off",
                     "on" if self.chk_oc.isChecked() else "off"))
@@ -3824,9 +3854,11 @@ class LifelinePane(QWidget):
             f"border: 1px solid {col}; padding: 8px 12px; background: #06080c;"
         )
         auto = "armed" if st.get("auto", True) else "DISARMED — watching only"
+        rtt = st.get("rtt")
+        ping = f"ping 1.1.1.1 → {rtt} ms ✓" if rtt else "ping 1.1.1.1 → no answer ✗"
         self.facts.setText(
             f"iface {st.get('iface') or '?'} · gw {st.get('gw') or 'none'} · strikes {strikes} · "
-            f"rtt {st.get('rtt') or '?'} ms · auto-heal {auto}\n"
+            f"{ping} · auto-resurrect {auto}\n"
             f"last beat {st.get('t')} · twin pid {pid or 'DEAD'}"
         )
         self._paint_guard(st)

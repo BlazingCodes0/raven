@@ -190,8 +190,17 @@ FINDINGS chips row under each crow = raw IPs/domains from output, click to copy
 - **Runtime ledger:** state → `/tmp/ravenheart/state.json`, events →
   `events.log`, control (auto/panic) → `control.json`, PID → `twin.pid`. Pane
   tails the ledger each 1.5s beat and mirrors events into the Logs tab.
-- **Controls:** AUTO-HEAL armed checkbox (writes `control.json`), RESURRECT NOW
-  (panic flag → twin performs the max heal immediately), SPAWN TWIN.
+- **Controls:** AUTO-HEAL armed + **AUTO RESURRECT** (both green = twin pings
+  `1.1.1.1` every 2s beat, writes a `PING` line to the ledger every ~30s and the
+  instant answers stop, then runs the heal ladder itself — no button press),
+  RESURRECT NOW (one-shot manual max heal; the `panic` flag is **consumed**
+  after one act, so one click = one resurrect), SPAWN TWIN, SWEEP FOR EYES.
+  The pane facts line shows the live probe: `ping 1.1.1.1 → 43.3 ms ✓`.
+  Fixed 2026-10-08: `panic` was never cleared, so one click made the twin
+  hard-bounce wlan0 every beat forever.
+- **Edit rule:** the guardian reverts app.py/ravenheart.py/SNAPSHOT.md to the
+  twin's boot-time copy — kill all raven/twin procs **and** `rm -rf
+  /tmp/ravenheart` before editing, otherwise your edit disappears in 2s.
 
 ## Big brother — the guardian mode (inside the same twin)
 
