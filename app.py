@@ -1789,12 +1789,15 @@ class CrowView(QWidget):
         self._refresh_elapsed()
         self._refresh_think()
 
+    def _text(self):
+        return self.crow.get("buf") or self.out.toPlainText()
+
     def refresh_findings(self):
         while self.findings_lay.count() > 1:
             item = self.findings_lay.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
-        for f in parse_findings(self.out.toPlainText()):
+        for f in parse_findings(self._text()):
             if self.findings_lay.count() > 40:
                 break
             chip = CopyButton(f, label=f)
@@ -1806,7 +1809,7 @@ class CrowView(QWidget):
         self._refresh_think()
 
     def _refresh_brief(self):
-        text = self.out.toPlainText()
+        text = self._text()
         if not text.strip():
             return
         paras = []
@@ -1815,7 +1818,7 @@ class CrowView(QWidget):
         self.brief.setHtml("<div style='font-size:12px'>" + "".join(paras) + "</div>")
 
     def _refresh_think(self):
-        text = self.out.toPlainText()
+        text = self._text()
         self.antidotes = []
         self.esc_records = []
         if not text.strip():
@@ -1986,6 +1989,8 @@ class CrowView(QWidget):
         self.out.moveCursor(QTextCursor.MoveOperation.End)
         self.out.insertPlainText(data)
         self.out.moveCursor(QTextCursor.MoveOperation.End)
+        buf = self.crow.get("buf", "") + data
+        self.crow["buf"] = buf[-400000:]
 
 
 class CrowPane(QWidget):
@@ -2323,6 +2328,7 @@ class CrowPane(QWidget):
         for i in range(len(crow["tasks"])):
             view.mark_task(i, TASK_PENDING)
         view.out.clear()
+        view.crow["buf"] = ""
         self.active = crow
         self.task_idx = 0
         view.started_at = None
@@ -2433,7 +2439,7 @@ class CrowPane(QWidget):
         if crow["role"] != "remedy" or not self._pending_thread:
             return
         key = self._pending_thread
-        feats = crow_features(view.out.toPlainText())
+        feats = crow_features(view.crow.get("buf") or view.out.toPlainText())
         pieces = []
         if feats.get("whois") and feats["whois"].get("registrar"):
             pieces.append(f"registered via {feats['whois']['registrar']}")
@@ -2515,7 +2521,7 @@ def save_crow_report(crow, view, log):
             lines.append("TRIAGE")
             for b in think.splitlines():
                 lines.append("  " + b)
-        out = view.out.toPlainText().strip()
+        out = (view.crow.get("buf") or view.out.toPlainText()).strip()
         if out:
             lines.append("")
             lines.append("TRANSCRIPT (tail 60 lines)")
