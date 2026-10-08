@@ -1,0 +1,271 @@
+# RAVEN — Conversation Snapshot
+
+> Used by a teacher running a pentest lab. Raven is a PyQt6 single-file app
+> (`/home/a/raven/app.py`) that gives students tool-presets and lets the teacher
+> spawn autonomous agent "crows" that run recon/pentest pipelines faster than
+> people can.
+
+## App facts
+
+- **Single file:** `/home/a/raven/app.py`; PyQt6, one shared `QProcess`, global
+  f-string `STYLE` (braces doubled `{{ }}`).
+- **Tabs:** Dashboard, Recon, Birdshit, Learn, Crow, Lifeline, Modules, OpenCode, Logs, Settings.
+- **Restart:** `setsid nohup python3 /home/a/raven/app.py > /tmp/opencode/raven.log 2>&1 < /dev/null &`
+  then `pgrep -a python3 | grep raven`. Startup ~8s.
+- **Shell gotcha:** `pkill -f "raven/app.py"` also matches the invoking zsh and
+  kills the shell → always start the kill/restart in SEPARATE bash calls.
+
+## Crow engine
+
+- Roles: `recon` (7 tasks), `pentest` (7 tasks), `sniff` (9 tasks).
+- Sniff tasks include: avahi daemon start, `arp-scan --localnet`, `avahi-browse`,
+  nmap phone scan, mdns/ssdp/llmnr listen (45s), **cast/dial http control
+  eavesdrop (40s)**, dns listen (30s), tls sni listen (30s), pcap save (60s)
+  → `{outdir}/{name}_wire.pcap`.
+- Template vars: `{target}`, `{name}`, `{outdir}` (= `/home/a/raven/crow`), `{iface}`
+  (live default-route iface, fallback `wlan0`).
+- One crow flies at a time; tasks are sequential; failed tasks are skipped with
+  state markers `TASK_PENDING/RUNNING/DONE/FAILED/STOPPED`.
+
+## ASK RAVEN (plain-language command bar on Crow tab)
+
+`parse_intent()` maps keywords: SNIFF = traffic/eyes/watch/listen/sniff/capture/
+monitor/wire/phone/airplay/cast; PENTEST = hack/exploit/attack/vuln/brute/
+pentest/break/crack/pwn; else RECON = scan/map/find/discover/enumerate/etc.
+Target auto-detects to the live subnet via `local_subnet()` (`ip -4 addr`),
+fallback `127.0.0.1`. Hit GO → spawns + releases the crow, auto-selects its view.
+
+Proven phrases:
+- `all eyes on me` → sniff on current subnet
+- `map my network` / `who is on my network` → recon subnet
+- `scan 10.0.0.5` → recon on that IP
+- `hack the dmz` → pentest on target/subnet
+- `watch for casting` → sniff (mdns/airplay/cast focus)
+
+## Human-readable briefing (CrowView)
+
+`human_brief(text)` parses the crow transcript into plain-English analyst lines:
+connection type/hotspot heuristic, devices, DNS domains with counts, TLS-SNI
+server names, cast device names (avahi), DIAL/chromecast app launches, cleartext
+media URLs, pcap evidence, and an honesty line ("page content stayed encrypted").
+Rendered in a `QTextBrowser` (BRIEFING panel, fixed 260–700px, scrollbar always
+on) with `_linkify()` making IPs/domains click-to-copy (`upx:` scheme →
+`_brief_clicked` copies to clipboard).
+
+FINDINGS chips row under each crow = raw IPs/domains from output, click to copy
+(`CopyButton`, flashes "COPIED").
+
+## Hotspot vs wifi (honest answers to the "watch my phone" question)
+
+- Hotspot signature heuristics: `172.20.10.x` → iPhone/macOS tether;
+  `192.168.43/42.x` → Android tether; else "regular Wi-Fi/LAN router".
+- **On a hotspot the laptop is a client** — the phone's own app traffic goes over
+  cellular and NEVER crosses wlan0. What is visible: your own DNS/SNI (echoed by
+  the phone as its resolver), mDNS/cast announcements, ARP.
+- **Media titles/sites are capturable** via cast/DIAL HTTP (cleartext app launch
+  + media URL on older TVs/DIAL) and mDNS service names. Modern hardened
+  Chromecasts/TLS casts leak only the domain, not the title. Video frames are
+  TLS+DRM, never recoverable passively.
+- Topologies that work: home-wifi sniff at gateway (domains/SNI), laptop-as-AP
+  (full DNS/SNI), cast to TV (app + title on segment).
+
+## Verified environment
+
+- Laptop wlan0 = `172.20.10.2/28`; gateway/phone = `172.20.10.1`
+  (MAC `b6:56:e3:cd:bb:64`, port 21/tcp open).
+- `tshark`/`dumpcap` work unprivileged; must use `-i wlan0` (NOT `any`).
+- `sudo -n arp-scan --localnet` works; `tcpdump` needs sudo.
+- Available: avahi-browse, netdiscover, tshark, nmap, socat, airmon-ng.
+  Missing: gssdp-discover, mdns-scan, chisel.
+
+## Learn tab
+
+- 27 modules: `RAVEN — Talk to it` (promo guide with copy-ready ASK RAVEN
+  phrases) then A–Z (Scope→Ethics). Each page: goal, tools chips, STEPS w/
+  COPY button, EXPECT/WATCH lines, DEEP DIVE bullets (dash prefix, not `▸`).
+- Crow tab body is wrapped in a `QScrollArea` for full-page scroll.
+
+## ANALYST READ — triage/thinking layer (CrowView)
+
+- `crow_features(text)` parses a transcript once into structured telemetry
+  dicts (arp, dns, sni, mdns, avahi, http, cast urls, ports, pcap, gw/our_ip);
+  both `human_brief()` and `triage()` read that same data.
+- `triage(f)` = senior-analyst judgment engine (SOC 5×5×5 + SANS pyramid of
+  pain): each finding has **what / why-it-matters / next-question / score 0–100 /
+  confidence %** and optionally a **next command**. Fires on: cleartext media
+  URL (highest), finance/crypto api, gateway unusual open port, throwaway-TLD
+  domain, repeat-domain beaconing, airplay/chromecast presence, DIAL app
+  launches, plain http paths, else an honest "quiet window" finding.
+- `hypothesis(f, hits, role)` => one-line "working theory" with score/confidence
+  + the top next senior move.
+- THINK panel is a `QTextBrowser` (ANALYST READ, 200–460px) under BRIEFING,
+  refreshed with each task; each finding renders a clickable
+  `<a href="thnk:idx">spawn & run: CMD</a>` (stored in `view.think_cmds`).
+- `CrowView._think_clicked` routes `thnk:` → `request_custom(cmd, target)`
+  (CrowPane) which spawns a one-task `custom` crow exactly like obey()'s
+  passthrough — so triage → command → new crow = the senior's loop. `upx:`
+  links still copy to clipboard.
+
+## Antidote crows + escalation (clickable issues)
+
+- Each ANALYST READ finding is now a **clickable issue card**: `ANTIDOTES`
+  playbook dict resolves to a purpose-built `remedy` crow (multi-probe
+  response) keyed by finding id — MEDIA-LEAK (curl/whois/dig/re-capture),
+  FINANCE-PROFILE (whois/dig/curl), ODD-PORT-PROBE (nmap -sV -sC / nc /
+  curl), THROWAWAY-DOMAIN, BEACON-CADENCE (dig + 120s/60s re-listens),
+  CAST-CONTROL-AUDIT, CLEARTEXT-PATH-AUDIT, CAST-FABRIC-MAP, EXTENDED-WATCH.
+  `antidote_tasks(h, target)` resolves `{media}/{host}/{domain}/{port}/{paths}`
+  from triage artifacts (url/host/domain/port/paths added to each hit).
+- Click the **issue heading** (or `▶ treat: send <LABEL> antidote (N probes)`)
+  → `request_remedy(label, tasks, target)` spawns a `remedy` role crow
+  (reuses `_pending_tasks` in spawn). Triage artifacts per finding:
+  `cast-media{url,host}`, `finance{domain}`, `beacon-repeat{domain}`,
+  `odd-port{port}`, `dyn-tld{domain}`, `http-sig{paths}`.
+- **ESCALATE** per finding → `pane.escalate(record)`: appends to
+  `pane.escalations`, FIELD WATCH flips **CRITICAL red** with the reason
+  (escalation list caps the watch), logs to log + statusbar, and auto-dispatches
+  the response crow. Busy guard: if a crow is flying, dispatch is refused
+  ("call it back first") but the escalation stays recorded.
+- spawn() role selection order: `_pending_tasks` (remedy) → `_pending_role`
+  (eyes) → radios. `tasks` defaults to `None` at top of the non-custom branch.
+- `save_crow_report()` now includes a TRIAGE section (plain text of the think
+  panel) alongside BRIEFING + transcript tail.
+- **Case-thread memory (loop killer):** every finding resolves to a thread key
+  (`thread_key(h)` → `domain|X` / `url|X` / `port|X`). `pane.threads` records
+  the lifecycle: `dispatched`/`escalated` (on treat-click or ESCALATE) →
+  `attributed`/`investigated` when a `remedy` crow returns and `_close_thread`
+  folds its evidence back in (whois registrar + age, Cloudflare edge, HTTP
+  status, dns via). The ANALYST READ renders per-finding state: green `✔ RESOLVED`
+  with the close-note, amber `… IN PROGRESS` for in-flight, and *no* treat/ESCAPE
+  links for either — verdicts are computed from **open hits only**, so a 157×
+  api.kraken.com sweep after the FINANCE-PROFILE ran reads
+  "VERDICT RESOLVED — nothing new to chase" instead of re-offering the same
+  antidote forever. Duplicate ESCALATEs are refused; FIELD WATCH unpins from
+  CRITICAL once threads close ("N escalated & closed").
+
+## Color warning system (severity scale)
+
+- Scale `sev_color(score)` + `severity_of(hits)` + `verdict_of(f, hits, role)`:
+  `CRITICAL (≥80, #ff5370)` / `HIGH (65+, #f0883e)` / `MEDIUM (45+, #d29922)` /
+  `LOW (20+, #3fb950)` / `WATCH (<20, #58a6ff)`.
+- Every CrowView header gets a live **severity badge** (right of the timer);
+  ANALYST READ shows a color-coded `⚠ VERDICT` banner (the decision) + the
+  working theory, and each finding row is colored/dashed by its own score.
+- Crow tab top has a **FIELD WATCH** banner = worst severity across all crows
+  this session; updates live via `view.on_verdict → pane._refresh_watch()` and
+  on crow return.
+
+## "ALL EYES ON ME" — intense watch role
+
+- `parse_intent` maps "all eyes…" / "eyes on …" → the new `eyes` role
+  (10 tasks, autonomous the whole segment, not just the phone): arp sweep +
+  live-host inventory + full-segment `nmap -sV --top-ports 200` probe +
+  avahi browse + mdns/ssdp/llmnr (45s) + cast/dial http eavesdrop (40s) +
+  DNS (60s) + TLS-SNI (60s) + 90s deep pcap — then auto-reads into the triage
+  verdict with colored decision + ranked next steps.
+- `obey()` sets a `_pending_role` (no radio button exists for "eyes") so spawn
+  uses the parsed role; other sniff phrases still make plain `sniff` crows.
+- Proven phrase: `all eyes on me` → `eyes` crow on live subnet CIDR.
+
+## Lifeline — the unconscious twin (was: Scan tab)
+
+- **Purpose:** this host never goes offline. The twin is a *separate process*
+  (`ravenheart.py`, stdlib only) with its own 2s heartbeat loop, spawned detached
+  via `start_new_session` — killing the Raven GUI/session does not stop it, and
+  the Lifeline tab re-spawns it if a student kills it too (zombie-proof: the
+  aliveness check reads `/proc/<pid>/stat` for `Z`, and old twins are reaped
+  with `waitpid(WNOHANG)`).
+- **Truth test of "online":** the twin proves connectivity by opening real
+  outbound TCP to `1.1.1.1`/`8.8.8.8` on 443/53, not just "associated with the
+  AP" — so a hotspot blocking the client still reads as down.
+- **Auto-heal ladder, well-behaved nouns poetry:** strike 1 rescan + hold wifi
+  power-save off; strike 2 re-associate the saved `802-11-wireless` profile or
+  DHCP-renew; strike 3 `nmcli device reapply`; strike ≥4 hard bounce
+  (`ip link set down/up` via `sudo -n`), re-apply, reconnect profile, renew
+  DHCP, and fail over to any second physical interface with carrier. Null-routed
+  or WRONG-mac cases loop the max phase forever — it never gives up.
+- **Honest limits label in-pane:** rootless = rescan/reassociate/nmcli renew;
+  `sudo -n` = broader bounce + DHCP. It cannot conjure a pulled antenna or
+  resurrect a hotspot that's powered off — it fights for links that exist.
+- **Runtime ledger:** state → `/tmp/ravenheart/state.json`, events →
+  `events.log`, control (auto/panic) → `control.json`, PID → `twin.pid`. Pane
+  tails the ledger each 1.5s beat and mirrors events into the Logs tab.
+- **Controls:** AUTO-HEAL armed checkbox (writes `control.json`), RESURRECT NOW
+  (panic flag → twin performs the max heal immediately), SPAWN TWIN.
+
+## Big brother — the guardian mode (inside the same twin)
+
+- **Purpose:** the twin stops being just a heart monitor — it actively waves the
+  flies away. Students who block opencode from running commands, reverse images,
+  sniff packets, or watch the screen get their process killed and their kit
+  quarantined, while the host keeps beating.
+- **Three token classes** scanned on every 2s beat against each process cmdline:
+  - `EXPEL` = a hand watching/reaching into the machine: xwd, scrot, maim, grim,
+    flameshot, spectacle, `import -window/-screen`, x11vnc/vncserver/xvnc/vino/
+    krfb, `x11grab`, `/dev/fb0`, `/dev/input/`, keylogger, pyautogui, `bash -i`,
+    `sh -i`, `/dev/tcp/`, `nc -e/-lvp`, ncat, socat, chisel, meterpreter,
+    msfconsole, `strace/gdb -p`, pspy, reveal. Kills after `threshold` (default
+    2) consecutive beats.
+  - `WATCH` = tools that *could* be used that way (xdotool, convert/magick,
+    binwalk/foremost, exiftool, steghide, tesseract, xxd, lsof, inotifywait,
+    `tcpdump -r`, wireshark/tshark -r, capinfos). Alerts ≤3 beats; with
+    AGGRESSIVE on, kills after 8.
+  - `ALLOW` = exact binaries/paths only (`raven/app.py`, `ravenheart.py`,
+    `/.opencode/bin/opencode`, `opencode serve|web|tui`, Xorg/Xwayland, kwin_wayland,
+    plasmashell, pulseaudio, pipewire, systemd, NetworkManager, avahi-daemon,
+    sshd, dbus-daemon, polkitd, chronyd, timesyncd, udisksd, logind,
+    accounts-daemon). **Never a loose substring** — a token like `opencode`
+    would whitelist any payload path containing the word.
+- **Expel = kill + cripple.** After SIGKILL (`sudo -n kill -9` fallback), the
+  kit file is *lifted* to `/tmp/ravenheart/lair/` and chmod 000: the first
+  non-system path token in the cmdline is moved out (so `sh /tmp/x/rev_kit nc
+  -lvp` loses `/tmp/x/rev_kit`, not `/bin/sh`).
+- **Integrity watch:** `app.py`/`ravenheart.py`/`SNAPSHOT.md` restored from
+  `/tmp/ravenheart/sync/`; `~/.ssh/authorized_keys` restored from backup (tested);
+  dotfiles/opencode configs + autostart/opencode/systemd dirs are WATCH-only
+  (operator owns their shell). Backups refreshed hourly. **The sync snapshot is
+  taken at twin boot** — so the guardian reverts any mid-session edits of
+  app.py/SNAPSHOT.md to the *boot-time* copy: before editing Raven code, kill all
+  raven/twin processes **and** `rm -rf /tmp/ravenheart`, then restart.
+- **Resurrect reflexes:** murdered app relaunched within ~12s of absence;
+  opencode engine (`~/.opencode/bin/opencode web`) within ~20s if the control
+  flag is on — killing the mother ship does not take the lab down.
+- **Controls (Lifeline pane):** BIG BROTHER armed, AGGRESSIVE, RESPAWN
+  app+opencode, SWEEP FOR EYES (live scan), RESURRECT NOW panic. All four are
+  **on by default** (`_sync_arm` seeds `control.json` on first boot; a saved file
+  is respected). Guard banner: SEV_CRIT on a fresh kill (<60s), SEV_HIGH whenever
+  acts>0, SEV_INFO when idle. Honest note: capture-busting also eats the
+  teacher's own screenshot tools — AGGRESSIVE is the escape hatch.
+- **Single-instance guard in the twin:** second copy of `ravenheart.py` exits at
+  boot if the PID file points at a live twin — no more twin-thrash over the
+  state file (earlier dev saw 6 twins fighting over `/tmp/ravenheart`).
+
+## Autostart on login
+
+- Wants Raven resurrect-on-auto and launched at startup. Done via XFCE XDG
+  autostart: `~/.config/autostart/raven.desktop` →
+  `/home/a/raven/raven_boot.sh` (detached `setsid nohup python3 app.py`). At
+  next login the app comes up and spawns its twin; the twin keeps everything
+  alive from there. `raven_boot.sh` doubles as the manual restart command.
+- One benign side effect: the twin's WATCH_DIRS includes `~/.config/autostart`,
+  so it logs one informational `WATCH: directory changed … raven.desktop` on
+  first boot after the file appears (alert only, no action).
+
+## Current running state (as of last snapshot save)
+
+- Started via `/home/a/raven/raven_boot.sh`: app PID + exactly one twin PID
+  (single-instance guard in `ravenheart.py`), startup ~12s,
+  `pgrep -af "python3.*(raven)"`.
+- `state.json` beating: `up true`, iface wlan0, gw 172.20.10.1, guard
+  `mode aggressive`. `control.json` seeded on first boot (auto/guard/aggressive/
+  opencode all true) by `_sync_arm`.
+- Big-brother headless suite green: 7/7 (armed+aggressive, both decoys expelled
+  + rev_kit quarantined, app.py tamper rollback, authorized_keys rollback,
+  murdered-app respawn, guardian acts≥1). Line: `QT_QPA_PLATFORM=offscreen
+  python3 -u /tmp/opencode/test_guardian.py`.
+
+## Recurring user asks / style notes
+- Wants things "human readable," "one click," "lazy man" friendly.
+- Wants honest framing of what's sniffable vs encrypted — never overclaim.
+- Answers should be short; when he says "read you restart" → verify `pgrep`,
+  check `/tmp/opencode/raven.log`, headless-smoke-test the Crow page.

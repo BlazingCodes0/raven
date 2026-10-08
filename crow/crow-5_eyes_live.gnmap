@@ -1,0 +1,4 @@
+# Nmap 7.99 scan initiated Thu Oct  8 16:05:46 2026 as: /usr/lib/nmap/nmap --privileged -sn -PR -PS22,80,443,5353 -oA /home/a/raven/crow/crow-5_eyes_live 172.20.10.0/28
+Host: 172.20.10.1 ()	Status: Up
+Host: 172.20.10.2 ()	Status: Up
+# Nmap done at Thu Oct  8 16:05:48 2026 -- 16 IP addresses (2 hosts up) scanned in 2.54 seconds

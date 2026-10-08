@@ -1,0 +1,100 @@
+RAVEN CROW REPORT — crow-1
+role: eyes   target: 172.20.10.0/28
+  task 01 [done] ensure mdns daemon is up
+  task 02 [done] arp sweep — who is actually here
+  task 03 [done] network inventory — live hosts
+  task 04 [done] full-segment service probe
+  task 05 [done] casting/named services (mdns browse)
+  task 06 [done] listen: casting & service announcements (45s)
+  task 07 [done] eavesdrop: cast/dial http control (40s)
+  task 08 [done] listen: dns queries on the wire (60s)
+  task 09 [done] listen: tls sni — who everyone talks to (60s)
+  task 10 [done] deep capture — full-segment pcap (90s)
+
+BRIEFING
+  —  network: gateway is 172.20.10.1 (Unknown: locally administered) — your laptop is 172.20.10.2.
+  —  connection: looks like an iPhone/macOS personal hotspot — Apple's classic 172.20.10.x tether range.
+  —  what it was doing: the phone's resolver answered queries for api.kraken.com ×88, models.opencode.ai ×4.
+  —  interesting: repeated calls to a crypto exchange api — looks like a trading app was polling live prices.
+  —  tls connections (server names in the clear): api.kraken.com ×11.
+  —  open gateway ports: 21/tcp ftp?, 49152/tcp tcpwrapped, 53/tcp domain.
+  —  evidence: 1276 packets saved to a pcap — open it in Wireshark to deep-dive.
+  —  read-out: all of the above is metadata — traffic direction, cast announcements, dns names, tls server names. the page content itself stayed encrypted inside those tunnels.
+
+TRIAGE
+  ⚠ VERDICT MEDIUM (64/100) — finance/crypto api in play — api.kraken.com. senior move: profile the api host so later look-alike queries on this network stand out.
+  WORKING THEORY  //  EYES crow on 172.20.10.1 — working theory: finance/crypto api in play — api.kraken.com (score 64/100, ~85% confidence). next senior move: profile the api host so later look-alike queries on this network stand out.
+  #1 finance/crypto api in play — api.kraken.com (score 64/100 · 85% conf)
+  why it matters: a trading/banking app is live-polling prices; it sets the clock on every other signal
+  next question a senior asks: profile the api host so later look-alike queries on this network stand out.
+  ▶ treat: send FINANCE-PROFILE antidote (3 probes)  ·  ESCALATE
+  #2 gateway answering on unusual port 49152/tcp (tcpwrapped) (score 62/100 · 60% conf)
+  why it matters: phone hotspots expose almost nothing — an odd open port is the exception a senior chases first
+  next question a senior asks: one directed service probe tells open-vs-wrapped and usually the app behind it.
+  ▶ treat: send ODD-PORT-PROBE antidote (3 probes)  ·  ESCALATE
+  #3 one domain hammered 88× — api.kraken.com (score 50/100 · 65% conf)
+  why it matters: steady repetition of a single name is exactly what beacons and api pollers both look like
+  next question a senior asks: decide between app-polling and beaconing before calling it C2.
+  ▶ treat: send BEACON-CADENCE antidote (3 probes)  ·  ESCALATE
+
+TRANSCRIPT (tail 60 lines)
+  2026-10-08T15:44:44.778070286+0000	172.20.10.1	api.kraken.com
+  2026-10-08T15:44:44.778160263+0000	172.20.10.1	api.kraken.com
+  2026-10-08T15:44:45.112967412+0000	172.20.10.2	api.kraken.com
+  2026-10-08T15:44:45.113111713+0000	172.20.10.2	api.kraken.com
+  2026-10-08T15:44:45.233844662+0000	172.20.10.1	api.kraken.com
+  2026-10-08T15:44:45.233918582+0000	172.20.10.1	api.kraken.com
+  2026-10-08T15:44:45.597695824+0000	172.20.10.2	api.kraken.com
+  2026-10-08T15:44:45.597798713+0000	172.20.10.2	api.kraken.com
+  2026-10-08T15:44:45.604396512+0000	172.20.10.1	api.kraken.com
+  2026-10-08T15:44:45.606321665+0000	172.20.10.1	api.kraken.com
+  2026-10-08T15:44:53.088320047+0000	172.20.10.2	api.kraken.com
+  2026-10-08T15:44:53.088370663+0000	172.20.10.2	api.kraken.com
+  2026-10-08T15:44:53.127649191+0000	172.20.10.1	api.kraken.com
+  2026-10-08T15:44:53.127650307+0000	172.20.10.1	api.kraken.com
+  2026-10-08T15:44:55.590374432+0000	172.20.10.2	models.opencode.ai
+  2026-10-08T15:44:55.590422696+0000	172.20.10.2	models.opencode.ai
+  2026-10-08T15:44:55.645714184+0000	172.20.10.1	models.opencode.ai
+  2026-10-08T15:44:55.651719406+0000	172.20.10.1	models.opencode.ai
+  2026-10-08T15:45:00.884082560+0000	172.20.10.2	api.kraken.com
+  2026-10-08T15:45:00.884213913+0000	172.20.10.2	api.kraken.com
+  2026-10-08T15:45:00.891230025+0000	172.20.10.1	api.kraken.com
+  2026-10-08T15:45:00.891376162+0000	172.20.10.1	api.kraken.com
+  2026-10-08T15:45:01.463241395+0000	172.20.10.2	api.kraken.com
+  2026-10-08T15:45:01.463375280+0000	172.20.10.2	api.kraken.com
+  2026-10-08T15:45:01.496209238+0000	172.20.10.1	api.kraken.com
+  2026-10-08T15:45:01.496351476+0000	172.20.10.1	api.kraken.com
+  2026-10-08T15:45:01.930620149+0000	172.20.10.2	api.kraken.com
+  2026-10-08T15:45:01.930751466+0000	172.20.10.2	api.kraken.com
+  2026-10-08T15:45:01.948055744+0000	172.20.10.1	api.kraken.com
+  2026-10-08T15:45:01.948201498+0000	172.20.10.1	api.kraken.com
+  2026-10-08T15:45:02.302433707+0000	172.20.10.2	api.kraken.com
+  2026-10-08T15:45:02.302524056+0000	172.20.10.2	api.kraken.com
+  2026-10-08T15:45:02.312748562+0000	172.20.10.1	api.kraken.com
+  2026-10-08T15:45:02.312749942+0000	172.20.10.1	api.kraken.com
+  92 packets captured
+  
+  [exit 0]
+  $ tshark -i wlan0 -a duration:60 -l -Y 'tls.handshake.extensions_server_name' -T fields -e frame.time -e ip.src -e tls.handshake.extensions_server_name
+  Capturing on 'wlan0'
+  2026-10-08T15:45:13.229859344+0000	172.20.10.2	api.kraken.com
+  2026-10-08T15:45:18.001007442+0000	172.20.10.2	api.kraken.com
+  2026-10-08T15:45:18.449862184+0000	172.20.10.2	api.kraken.com
+  2026-10-08T15:45:18.795711809+0000	172.20.10.2	api.kraken.com
+  2026-10-08T15:45:19.159323012+0000	172.20.10.2	api.kraken.com
+  2026-10-08T15:45:23.236084117+0000	172.20.10.2	api.kraken.com
+  2026-10-08T15:45:47.745137061+0000	172.20.10.2	api.kraken.com
+  2026-10-08T15:45:48.047564179+0000	172.20.10.2	api.kraken.com
+  2026-10-08T15:45:48.350800908+0000	172.20.10.2	api.kraken.com
+  2026-10-08T15:45:49.188551970+0000	172.20.10.2	api.kraken.com
+  2026-10-08T15:46:03.187825264+0000	172.20.10.2	api.kraken.com
+  11 packets captured
+  
+  [exit 0]
+  $ tshark -i wlan0 -a duration:90 -w /home/a/raven/crow/crow-1_eyes_wire.pcap
+  Capturing on 'wlan0'
+  1276 packets captured
+  
+  [exit 0]
+  
+  CROW RETURNED — 10/10 tasks in 8:06

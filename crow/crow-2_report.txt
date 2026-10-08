@@ -1,0 +1,87 @@
+RAVEN CROW REPORT — crow-2
+role: remedy   target: 172.20.10.1
+  task 01 [done] registration trail
+  task 02 [done] resolve + records
+  task 03 [done] what the api answers
+
+BRIEFING
+  —  network: no arp results captured on this run (target may be a subnet through a router).
+  —  quiet network this window — no hosts answering, no queries, no cast announcements.
+
+TRIAGE
+  ⚠ VERDICT WATCH (18/100) — the platform is a registered property, not a shadow; tie it to the app observed polling it.
+  WORKING THEORY  //  REMEDY crow on target — working theory: ownership: MarkMonitor Inc. · created 2000-04-03T10:39:06Z (score 18/100, ~85% confidence). next senior move: the platform is a registered property, not a shadow; tie it to the app observed polling it.
+  #1 ownership: MarkMonitor Inc. · created 2000-04-03T10:39:06Z (score 18/100 · 85% conf)
+  why it matters: registration identity is the senior's attribution answer — who actually maintains the platform
+  next question a senior asks: the platform is a registered property, not a shadow; tie it to the app observed polling it.
+  ▶ treat: send EXTENDED-WATCH antidote (1 probes)  ·  ESCALATE
+  #2 api fronts via cloudflare edge (HTTP 404, server cloudflare, TLS/HSTS on) (score 12/100 · 90% conf)
+  why it matters: the origin IP hides behind a reverse proxy — passive profiling cannot see past the edge
+  next question a senior asks: a live, hardened property confirmed; deeper fingerprinting needs the edge, not the wire.
+  ▶ treat: send EXTENDED-WATCH antidote (1 probes)  ·  ESCALATE
+  #3 domain resolves live (104.17.185.205, 104.17.186.205, 104.17.187.205) · soa art.ns.cloudflare.com (score 10/100 · 85% conf)
+  why it matters: live A records behind an authoritative chain mean a working service, not a parked or dead name
+  next question a senior asks: lookup closes the C2-vs-app question for this target: a real platform behind a CDN.
+  ▶ treat: send EXTENDED-WATCH antidote (1 probes)  ·  ESCALATE
+
+TRANSCRIPT (tail 60 lines)
+  Protecting companies and consumers in a digital world.
+  
+  Visit MarkMonitor at https://www.markmonitor.com
+  Contact us at +1.8007459229
+  In Europe, at +44.02032062220
+  ----
+  
+  [exit 0]
+  $ dig api.kraken.com any +noall +answer
+  api.kraken.com.		99	IN	A	104.17.187.205
+  api.kraken.com.		99	IN	A	104.17.186.205
+  api.kraken.com.		99	IN	A	104.17.189.205
+  api.kraken.com.		99	IN	A	104.17.185.205
+  api.kraken.com.		99	IN	A	104.17.188.205
+  kraken.com.		5	IN	SOA	art.ns.cloudflare.com. dns.cloudflare.com. 2416953872 10000 2400 604800 5
+  api.kraken.com.		99	IN	A	104.17.187.205
+  api.kraken.com.		99	IN	A	104.17.186.205
+  api.kraken.com.		99	IN	A	104.17.189.205
+  api.kraken.com.		99	IN	A	104.17.185.205
+  api.kraken.com.		99	IN	A	104.17.188.205
+  kraken.com.		5	IN	SOA	art.ns.cloudflare.com. dns.cloudflare.com. 2416953872 10000 2400 604800 5
+  api.kraken.com.		99	IN	A	104.17.187.205
+  api.kraken.com.		99	IN	A	104.17.186.205
+  api.kraken.com.		99	IN	A	104.17.189.205
+  api.kraken.com.		99	IN	A	104.17.185.205
+  api.kraken.com.		99	IN	A	104.17.188.205
+  kraken.com.		5	IN	SOA	art.ns.cloudflare.com. dns.cloudflare.com. 2416953872 10000 2400 604800 5
+  api.kraken.com.		99	IN	A	104.17.187.205
+  api.kraken.com.		99	IN	A	104.17.186.205
+  api.kraken.com.		99	IN	A	104.17.189.205
+  api.kraken.com.		99	IN	A	104.17.185.205
+  api.kraken.com.		99	IN	A	104.17.188.205
+  kraken.com.		5	IN	SOA	art.ns.cloudflare.com. dns.cloudflare.com. 2416953872 10000 2400 604800 5
+  api.kraken.com.		99	IN	A	104.17.187.205
+  api.kraken.com.		99	IN	A	104.17.186.205
+  api.kraken.com.		99	IN	A	104.17.189.205
+  api.kraken.com.		99	IN	A	104.17.185.205
+  api.kraken.com.		99	IN	A	104.17.188.205
+  kraken.com.		5	IN	SOA	art.ns.cloudflare.com. dns.cloudflare.com. 2416953872 10000 2400 604800 5
+  
+  [exit 0]
+  $ curl -sI https://api.kraken.com
+  HTTP/2 404 
+  date: Thu, 08 Oct 2026 15:48:00 GMT
+  content-type: application/json
+  content-length: 38
+  cache-control: private, max-age=0, no-store, no-cache, must-revalidate, post-check=0, pre-check=0
+  expires: Thu, 01 Jan 1970 00:00:01 GMT
+  referrer-policy: same-origin
+  x-frame-options: SAMEORIGIN
+  strict-transport-security: max-age=31536000; includeSubDomains; preload
+  x-content-type-options: nosniff
+  set-cookie: __cf_bm=eFipt3Na0QDPCta4H.BEjAhYwmNCOo7dOmmb1jONFoA-1791474480.2190769-1.0.1.1-.q.yiRxMOz4O3kg1p_ihVJ1.7IDxbHvwbVpuWy4Gm7ogaGSjCDiELwfgU3.5AH5LqX0m92uvvkSDUrB12D.9vJi2OONUatRStUYirRegt8VdX0a.IalD97dDDqOg7sLG; HttpOnly; SameSite=None; Secure; Path=/; Domain=kraken.com; Expires=Thu, 08 Oct 2026 16:18:00 GMT
+  server: cloudflare
+  cf-ray: a476498d5e169236-SEA
+  
+  
+  [exit 0]
+  
+  CROW RETURNED — 3/3 tasks in 0:01
