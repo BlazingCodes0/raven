@@ -5697,6 +5697,7 @@ class FinchPane(QWidget):
         self._ledger = []
         self._prev_link = None
         self._loss = []
+        self._pi = 0
         self.tls_f = self.dir / "tls_state.json"
         self.exec_f = self.dir / "exec_state.json"
         self.drops_f = self.dir / "ids_drops.json"
@@ -5915,9 +5916,9 @@ class FinchPane(QWidget):
 
     def _rearm_if_roamed(self):
         conn = self.baseline.get("conn", {})
-        cur = next((a for a in self._aps() if a["inuse"]), None)
-        if cur and cur.get("ssid") and cur.get("ssid") != conn.get("ssid"):
-            self.speak(f"roamed {conn.get('ssid') or '?'} → {cur['ssid']} — "
+        ssid = self._link()[0]
+        if ssid and ssid != conn.get("ssid"):
+            self.speak(f"roamed {conn.get('ssid') or '?'} → {ssid} — "
                        f"re-seeding field reference (no stale baseline)", CRIMSON)
             self._seed_ref()
             self._tls_snapshot()
@@ -5950,23 +5951,28 @@ class FinchPane(QWidget):
         if not self.armed:
             return
         try:
+            self._pi += 1
+            p = self._pi
             self._rearm_if_roamed()
             base = self.baseline
+            # fast lane (every 2s): L2 tripwires stay hot, everything else is cheap reads
             self._hop_bite(base)
             self._deauth_bite(base)
             self._arp_bite(base)
-            self._persist_bite(base)
-            self._code_bite(base)
-            self._ca_bite()
             self._dns_bite()
             self._trace_bite()
-            self._exec_bite()
-            self._beacon_bite()
             self._ids_bite()
             self._tls_pin()
-            if self.posture in ("PECK", "BITE"):
+            # slow lane (~10s): wifi scan for evil twin, dir walks, hashes
+            if p % 5 == 0:
                 self._twin_bite(base)
-            if self.posture == "BITE":
+                self._persist_bite(base)
+                self._code_bite(base)
+                self._ca_bite()
+            # heaviest lane (~20s): exec-fingerprint walk, beacon stats, fuser grab
+            if p % 10 == 0:
+                self._exec_bite()
+                self._beacon_bite()
                 self._grab_bite()
             self.status.setText(f"{self.posture} · bites {self.bites}")
         except Exception as e:
@@ -6368,7 +6374,6 @@ class FinchPane(QWidget):
         dirs = (os.path.expanduser("~/.local/bin"),
                 os.path.expanduser("~/bin"),
                 "/tmp")
-        me = os.getpid()
         cur = {}
         for d in dirs:
             try:
@@ -6376,24 +6381,34 @@ class FinchPane(QWidget):
                     if not p.is_file() or p.is_symlink() or str(p).startswith(str(self.dir)):
                         continue
                     try:
-                        head = p.read_bytes()[:64]
+                        head = p.read_bytes()[:2]
+                        st = p.stat()
                     except Exception:
                         continue
-                    if not (head.startswith(b"\x7fELF") or head.startswith(b"#!")):
+                    if head not in (b"\x7fE", b"#!"):
                         continue
-                    cur[str(p)] = self._hash(p)
+                    # fingerprint by stat — never read whole payloads on a 2s loop
+                    cur[str(p)] = (st.st_size, st.st_mtime_ns)
             except Exception:
                 pass
         state = getattr(self, "_exec", {})
-        if state:
-            for path, h in sorted(cur.items()):
-                if state.get(path) == h:
+        if state and any(not (isinstance(v, (tuple, list)) and len(v) == 2
+                              and isinstance(v[0], int)) for v in state.values()):
+            state = self._exec = cur
+            self._save(cur, self.exec_f)
+        if state and state != cur:
+            blessed = set(self.whitelist.get("exec", []) or [])
+            for path, (sz, mt) in sorted(cur.items()):
+                prev = state.get(path)
+                if prev == (sz, mt) or (isinstance(prev, (tuple, list)) and tuple(prev) == (sz, mt)):
+                    continue
+                if path in blessed:
                     continue
                 key = "exec:" + path
                 if self._dedupe(key, window=300):
                     continue
                 if self.posture == "HARVEST":
-                    self._bite(f"NEW EXEC {path}: WOULD quarantine (revoke exec)", None)
+                    self._bite(f"NEW EXEC {path} ({sz} bytes): WOULD quarantine (revoke exec)", None)
                     continue
                 r = self._run(["chmod", "-x", path])
                 moved = ""
@@ -6422,7 +6437,7 @@ class FinchPane(QWidget):
         return False
 
     def _beacon_bite(self):
-        out = self._run(["sudo", "ss", "-tnp", "state", "established"])
+        out = self._run(["ss", "-tnp", "state", "established"])
         if not out or out.returncode != 0:
             return
         now = time.time()
@@ -6488,6 +6503,8 @@ class FinchPane(QWidget):
                 return
         except Exception:
             pass
+        # roll the log so a fresh daemon never replays pre-boot alerts at offset 0
+        self._run(["sudo", "truncate", "-s", "0", str(ids / "eve.json")])
         self._run(["sudo", "bash", str(ids / "run_suricata.sh")])
         self.speak("IDS (suricata) launched on wlan0", NEON)
 
