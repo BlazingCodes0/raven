@@ -5692,6 +5692,8 @@ class FinchPane(QWidget):
         self.t0 = 0.0
         self._seen = {}
         self._ledger = []
+        self._prev_link = None
+        self._loss = []
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -5723,7 +5725,7 @@ class FinchPane(QWidget):
 
         self.tick = QTimer(self)
         self.tick.timeout.connect(self._poll)
-        self.tick.start(4000)
+        self.tick.start(2000)
         self.speak("the vampire finch is on the wing — auto-armed, posture BITE, "
                    "ready to defend and bite back", CRIMSON)
         QTimer.singleShot(1000, self.arm)
@@ -5932,6 +5934,8 @@ class FinchPane(QWidget):
         try:
             self._rearm_if_roamed()
             base = self.baseline
+            self._hop_bite(base)
+            self._deauth_bite(base)
             self._arp_bite(base)
             self._persist_bite(base)
             self._code_bite(base)
@@ -5945,7 +5949,10 @@ class FinchPane(QWidget):
 
     def _arp_bite(self, base):
         neigh = self._neigh()
+        gw = self._gw()
         for ip, mac in neigh.items():
+            if ip == gw:  # the gateway hop gets its own louder bite (_hop_bite)
+                continue
             old = base.get("neigh", {}).get(ip)
             if old is not None and old != mac:
                 key = f"arp:{ip}:{old}->{mac}"
@@ -6002,6 +6009,72 @@ class FinchPane(QWidget):
                 self._bite(f"CODE TAMPER {name} — bitten: restored to git HEAD ({ok})",
                            f"git checkout -- {name}")
 
+    def _gw(self):
+        try:
+            out = subprocess.run(["ip", "route", "show", "default"],
+                                 capture_output=True, text=True, timeout=4).stdout
+            m = re.search(r"default via ([\d.]+)", out)
+            return m.group(1) if m else None
+        except Exception:
+            return None
+
+    def _surge(self):
+        out = self._run(["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show", "--active"])
+        prof = None
+        if out:
+            for line in out.stdout.splitlines():
+                p = nmcli_tokens(line)
+                if len(p) >= 2 and "wireless" in p[1]:
+                    prof = p[0]
+                    break
+        if not prof:
+            return "no wifi profile"
+        r = self._run(["nmcli", "connection", "up", prof])
+        return "surged" if (r and not r.returncode) else f"fail {r.returncode if r else '?'}"
+
+    def _hop_bite(self, base):
+        gw = self._gw()
+        if not gw:
+            return
+        neigh = self._neigh()
+        mac = neigh.get(gw)
+        old = base.get("neigh", {}).get(gw)
+        if not mac or not old or old == mac:
+            return
+        key = f"hop:{gw}:{old}->{mac}"
+        if self._dedupe(key, window=90):
+            return
+        dev = base.get("dev", "wlan0")
+        self._run(["ip", "neigh", "replace", gw, "lladdr", old, "dev", dev])
+        if self.posture == "HARVEST":
+            self._bite(f"GATEWAY HIJACK {gw} {mac}: WOULD restore {old} + surge on {dev}", None)
+            return
+        ok = self._surge()
+        self._bite(f"GATEWAY HIJACK {gw} {mac} — bitten: restored {old} on {dev}, {ok}",
+                   f"ip neigh replace {gw} {old} + surge")
+
+    def _deauth_bite(self, base):
+        now = time.time()
+        linked = self._link()
+        was = bool(self._prev_link)
+        self._prev_link = bool(linked and linked[1])
+        if was and not self._prev_link:
+            self._loss.append(now)
+        self._loss = [t for t in self._loss if now - t <= 15.0]
+        n = len(self._loss)
+        if n < 3:
+            return
+        if self._dedupe("deauth", window=90):
+            self._loss = []
+            return
+        self._loss = []
+        if self.posture == "HARVEST":
+            self._bite(f"DEAUTH FLOOD — {n} rapid link losses in 15s: WOULD surge to saved profile", None)
+            return
+        ok = self._surge()
+        self._bite(f"DEAUTH FLOOD — {n} rapid link losses in 15s; bitten: {ok}",
+                   f"surge to saved wifi profile")
+
     def _twin_bite(self, base):
         conn = base.get("conn", {})
         if not conn:
@@ -6012,15 +6085,19 @@ class FinchPane(QWidget):
             key = "twin:" + cur["bssid"]
             if self._dedupe(key):
                 return
-            out = self._run(["nmcli", "-t", "-f", "NAME", "connection", "show", "--active"])
-            prof = (out.stdout.strip().splitlines() or ["?"])[0] if out else "?"
             if self.posture == "PECK":
-                self._bite(f"PREEMPTED to {cur['bssid']}: would surge back to trusted ap (active '{prof}')", None)
+                self._bite(f"PREEMPTED to {cur['bssid']}: would surge back to trusted ap", None)
                 return
-            r = self._run(["nmcli", "connection", "up", prof])
-            ok = "surged" if (r and not r.returncode) else f"fail {r.returncode if r else '?'}"
+            ok = self._surge()
             self._bite(f"EVIL TWIN PREEMPTED us ({cur['bssid']}) — bitten: {ok}",
-                       f"nmcli connection up {prof}")
+                       f"surge to saved wifi profile")
+
+    def _proc_cmdline(self, pid):
+        try:
+            cmd = (Path("/proc") / str(pid) / "cmdline").read_bytes()
+            return cmd.replace(b"\0", b" ").decode("utf-8", "replace").strip()
+        except Exception:
+            return ""
 
     def _grab_bite(self):
         banned = set(self.whitelist.get("grabs", []))
@@ -6036,6 +6113,37 @@ class FinchPane(QWidget):
             ok = "dropped" if (r and not r.returncode) else (f"fail {r.returncode if r else '?'}")
             self._bite(f"WEBCAM GRAB pid {pid}/{name} — bitten: {ok}",
                        f"kill {pid} ({name})")
+        CAP_TOKS = ("xwd ", " scrot ", "maim ", " grim ", "grimscape", "flameshot",
+                    "spectacle", "x11vnc", "vncserver", "vino", " krfb", "x11grab",
+                    "import -window", "import -screen", "/dev/fb0", "/dev/input/",
+                    "keylogger", "pyautogui", "parec", "arecord", "kazam",
+                    "simplescreenrecorder")
+        me = os.getpid()
+        try:
+            pids = [int(d) for d in os.listdir("/proc") if d.isdigit()]
+        except Exception:
+            pids = []
+        for pid in sorted(pids):
+            if pid == me:
+                continue
+            cmd = self._proc_cmdline(pid)
+            if not cmd:
+                continue
+            name = self._proc_name(pid)
+            for t in CAP_TOKS:
+                if t not in cmd:
+                    continue
+                key = f"grab:{pid}:{t.strip()}"
+                if self._dedupe(key):
+                    break
+                if not name or name in banned:
+                    self.speak(f"capture {pid}/{name or '?'} [{t.strip()}] — whitelisted, left alone", MUTED)
+                    break
+                r = self._run(["kill", str(pid)])
+                ok = "dropped" if (r and not r.returncode) else (f"fail {r.returncode if r else '?'}")
+                self._bite(f"SCREEN/AUDIO GRAB pid {pid}/{name or '?'} [{t.strip()}] — bitten: {ok}",
+                           f"kill {pid} ({name or '?'}) [{t.strip()}]")
+                break
         for line in self._mic_clients():
             if self._dedupe("mic:" + line):
                 continue
