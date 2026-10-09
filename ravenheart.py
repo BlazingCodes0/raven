@@ -564,6 +564,104 @@ def integrity_scan():
         INTEGRITY[d] = snap
 
 
+def tls_snap():
+    def ca_set():
+        s = set()
+        for d in ("/etc/ssl/certs",
+                  os.path.expanduser("~/.local/share/ca-certificates"),
+                  "/usr/local/share/ca-certificates"):
+            try:
+                for n in os.listdir(d):
+                    p = os.path.join(d, n)
+                    if os.path.isfile(p):
+                        try:
+                            s.add((d, n, os.path.getsize(p)))
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+        return s
+    nss = {}
+    nssdir = os.path.expanduser("~/.pki/nssdb")
+    try:
+        for n in os.listdir(nssdir):
+            nss[n] = int(os.path.getmtime(os.path.join(nssdir, n)))
+    except OSError:
+        pass
+    resolv = []
+    try:
+        for line in open("/etc/resolv.conf", errors="replace"):
+            parts = line.split()
+            if len(parts) >= 2 and parts[0] == "nameserver":
+                resolv.append(parts[1])
+    except OSError:
+        pass
+    return {"ca": sorted(list(ca_set())), "nss": nss, "resolv": sorted(resolv)}
+
+
+def tls_watch():
+    state_f = MIRROR + "/tls_state.json"
+    st = load(state_f)
+    cur = tls_snap()
+    if st.get("ca") and st["ca"] != cur["ca"]:
+        newc = sorted(set(cur["ca"]) - set(st["ca"]))
+        removed = sorted(set(st["ca"]) - set(cur["ca"]))
+        for d, n, _sz in newc:
+            ev("EXPEL", "CA cert added into trust store: %s/%s" % (d, n))
+            if ctl().get("aggressive"):
+                q = os.path.expanduser("~/.ravenheart/quarantine/ca")
+                try:
+                    os.makedirs(q, exist_ok=True)
+                    shout("mv %s %s" % (shlex.quote(os.path.join(d, n)),
+                                        shlex.quote(os.path.join(q, n))))
+                    ev("ACT", "quarantined injected CA %s" % n)
+                except OSError as e:
+                    ev("ERR", "ca quarantine failed: %r" % e)
+        if removed:
+            ev("WATCH", "CA cert removed from store: %s"
+               % ", ".join("%s/%s" % (x[0], x[1]) for x in removed[:3]))
+    if st.get("resolv") and st["resolv"] != cur["resolv"]:
+        diff = [x for x in set(st["resolv"]) ^ set(cur["resolv"])]
+        ev("WATCH", "resolver changed: %s (was %s)" % (", ".join(diff), ", ".join(st["resolv"])))
+        if ctl().get("aggressive"):
+            tmp = "/tmp/ravenheart/resolv.base"
+            try:
+                with open(tmp, "w") as f:
+                    f.write("# restored by ravenheart\n" +
+                            "".join("nameserver %s\n" % ns for ns in st["resolv"]))
+                shout("cp %s /etc/resolv.conf" % tmp)
+                ev("ACT", "resolver restored to baseline")
+            except OSError as e:
+                ev("ERR", "resolver restore failed: %r" % e)
+    if st.get("nss") and st["nss"] != cur["nss"]:
+        touched = [k for k in cur["nss"] if k not in st["nss"] or st["nss"][k] != cur["nss"][k]][:3]
+        ev("WATCH", "NSS CA store touched: %s" % ", ".join(touched))
+    dump(state_f, cur)
+
+
+def trace_watch():
+    me = os.getpid()
+    trap = 0
+    try:
+        for line in open("/proc/%d/status" % me, errors="replace"):
+            if line.startswith("TracerPid:"):
+                trap = int(line.split()[1])
+                break
+    except OSError:
+        return
+    if not trap:
+        return
+    name = "?"
+    try:
+        name = open("/proc/%d/comm" % trap).read().strip()
+    except OSError:
+        pass
+    ev("EXPEL", "ptrace on the twin: pid %d (%s)" % (trap, name))
+    if ctl().get("aggressive"):
+        shout("kill -9 %d" % trap)
+        ev("ACT", "killed ptrace attacker %d (%s)" % (trap, name))
+
+
 def guardian():
     global OFF
     ps = pscan()
@@ -582,6 +680,8 @@ def guardian():
                     break
     OFF = {k: v for k, v in OFF.items() if k in ps}
     integrity_scan()
+    tls_watch()
+    trace_watch()
     respawn_guard(ps)
     c = ctl()
     return {"mode": "aggressive" if c.get("aggressive") else ("armed" if c.get("guard") else "off"),

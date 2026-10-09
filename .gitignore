@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 *.log
+ids/eve.json
+ids/suricata.pid
+ids/suricata.live

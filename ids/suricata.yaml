@@ -1,0 +1,37 @@
+%YAML 1.1
+---
+vars:
+  address-groups:
+    HOME_NET: "[172.20.10.0/24]"
+    EXTERNAL_NET: "!$HOME_NET"
+  port-groups:
+    HTTP_PORTS: "[80,8080,8888]"
+    SHELLCODE_PORTS: "[!22]"
+
+default-rule-path: /home/a/raven/ids
+default-log-dir: /home/a/raven/ids
+rule-files:
+  - raven.rules
+
+af-packet:
+  - interface: wlan0
+    cluster-id: 99
+    cluster-type: cluster_flow
+    defrag: yes
+    use-mmap: yes
+
+runmode: autofp
+
+outputs:
+  - eve-log:
+      enabled: yes
+      filetype: regular
+      filename: /home/a/raven/ids/eve.json
+      level: info
+      types:
+        - alert:
+            payload: yes
+            metadata: yes
+
+  - stats:
+      enabled: no

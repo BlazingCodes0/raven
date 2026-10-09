@@ -5664,10 +5664,13 @@ class FinchPane(QWidget):
     SHIELD reports; FINCH bites back. Three postures, all bounded and local to
     this machine:
       HARVEST — watch only, log what a bite WOULD have done.
-      PECK    — heal our own stuff: restore poisoned ARP neighbours,
-                quarantine rogue autostart, git-restore tampered raven code.
-      BITE    — everything in PECK, plus drop webcam grabbers and surge back
-                onto the trusted access point when an evil twin preempts us.
+      PECK    — heal our own stuff: restore poisoned ARP neighbours + resolver,
+                quarantine rogue autostart, new executables, and injected CA
+                certificates, git-restore tampered raven code.
+      BITE    — everything in PECK, plus drop webcam/screen/audio grabbers,
+                kill ptrace-attackers and egress beacons, surge back onto the
+                trusted AP on deauth/twin/hop attack, and firewall-block IPs
+                flagged by the Suricata IDS feed.
     Every action lands on the ledger and is reversible / documented.
     """
 
@@ -5694,6 +5697,15 @@ class FinchPane(QWidget):
         self._ledger = []
         self._prev_link = None
         self._loss = []
+        self.tls_f = self.dir / "tls_state.json"
+        self.exec_f = self.dir / "exec_state.json"
+        self.drops_f = self.dir / "ids_drops.json"
+        self._tls = self._load(self.tls_f)
+        self._exec = self._load(self.exec_f)
+        self._drops = self._load(self.drops_f)
+        self._beacon = {}
+        self._ids_off = 0
+        self._tls_due = 0.0
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -5716,6 +5728,9 @@ class FinchPane(QWidget):
         self.btn_export = QPushButton("EXPORT BITE LOG")
         self.btn_export.clicked.connect(self.export_ledger)
         row.addWidget(self.btn_export)
+        self.btn_unblock = QPushButton("UNBLOCK IDS")
+        self.btn_unblock.clicked.connect(self.unblock_ids)
+        row.addWidget(self.btn_unblock)
         lay.addLayout(row)
 
         self.view = QPlainTextEdit()
@@ -5865,6 +5880,8 @@ class FinchPane(QWidget):
     # --- arm / whitelist --------------------------------------------------
     def arm(self):
         self._seed_ref()
+        self._tls_snapshot()
+        self._ids_launch()
         self.armed = True
         self.t0 = time.time()
         self.bites = 0
@@ -5903,6 +5920,7 @@ class FinchPane(QWidget):
             self.speak(f"roamed {conn.get('ssid') or '?'} → {cur['ssid']} — "
                        f"re-seeding field reference (no stale baseline)", CRIMSON)
             self._seed_ref()
+            self._tls_snapshot()
 
     def _set_posture(self, p):
         if p not in self.POSTURES:
@@ -5911,8 +5929,8 @@ class FinchPane(QWidget):
         self.status.setText(f"{p} · bites {self.bites}")
         mode = {
             "HARVEST": "watch only, no mutations",
-            "PECK": "heal own gear (arp-restore, quarantine rogue autostart, git-restore tamper)",
-            "BITE": "active bite-back live (PECK + drop webcam grabbers + surge to trusted ap)",
+            "PECK": "heal own gear (arp/dns-restore, quarantine rogue autostart + new exec + injected CA, git-restore tamper)",
+            "BITE": "active bite-back live (PECK + drop grabbers, kill ptrace beacons, firewall IDS IPs, surge to trusted ap)",
         }[p]
         self.speak(f"posture → {p} — {mode}", CRIMSON)
 
@@ -5939,6 +5957,13 @@ class FinchPane(QWidget):
             self._arp_bite(base)
             self._persist_bite(base)
             self._code_bite(base)
+            self._ca_bite()
+            self._dns_bite()
+            self._trace_bite()
+            self._exec_bite()
+            self._beacon_bite()
+            self._ids_bite()
+            self._tls_pin()
             if self.posture in ("PECK", "BITE"):
                 self._twin_bite(base)
             if self.posture == "BITE":
@@ -6149,6 +6174,378 @@ class FinchPane(QWidget):
                 continue
             app = line.split("\t")[-1] if "\t" in line else line
             self._bite(f"MIC CLIENT active: {app} — named for the ledger; reassign source to silence", None)
+
+    # --- TLS / DNS / CA trust-store defense ---------------------------------
+    def _tls_snapshot(self):
+        def ca_set():
+            s = set()
+            for base in ("/etc/ssl/certs",
+                         os.path.expanduser("~/.local/share/ca-certificates"),
+                         "/usr/local/share/ca-certificates"):
+                try:
+                    for p in Path(base).iterdir():
+                        if p.is_file():
+                            try:
+                                s.add((base, p.name, p.stat().st_size))
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+            return s
+        nss = os.path.expanduser("~/.pki/nssdb")
+        nss_m = {}
+        try:
+            for p in Path(nss).iterdir():
+                nss_m[p.name] = int(p.stat().st_mtime)
+        except Exception:
+            pass
+        resolv = []
+        try:
+            for line in Path("/etc/resolv.conf").read_text(errors="replace").splitlines():
+                m = re.search(r"^\s*nameserver\s+(\S+)", line)
+                if m:
+                    resolv.append(m.group(1))
+        except Exception:
+            pass
+        self._tls = {"ca": sorted(ca_set()),
+                     "nss": nss_m,
+                     "resolv": sorted(resolv),
+                     "at": time.strftime("%Y-%m-%d %H:%M:%S")}
+        self._save(self._tls, self.tls_f)
+
+    def _ca_bite(self):
+        base = getattr(self, "_tls", {})
+        if not base.get("ca"):
+            return
+
+        def ca_set():
+            s = set()
+            for d in ("/etc/ssl/certs",
+                      os.path.expanduser("~/.local/share/ca-certificates"),
+                      "/usr/local/share/ca-certificates"):
+                try:
+                    for p in Path(d).iterdir():
+                        if p.is_file():
+                            try:
+                                s.add((d, p.name, p.stat().st_size))
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+            return s
+        cur = ca_set()
+        old = set(tuple(x) for x in base.get("ca", []))
+        for item in sorted(cur - old):
+            b, name, _st = item
+            key = "ca:" + str(item)
+            if self._dedupe(key, window=900):
+                continue
+            if self.posture == "HARVEST":
+                self._bite(f"NEW CA CERT in trust store {b}/{name}: WOULD quarantine", None)
+                continue
+            dst = self.qdir / "ca"
+            dst.mkdir(exist_ok=True)
+            moved = ""
+            try:
+                shutil.move(str(Path(b) / name), str(dst / name))
+                moved = f"→ {dst / name}"
+            except OSError as e:
+                moved = f"(move failed {e})"
+            self._bite(f"CA CERT injected {b}/{name} — QUARANTINED {moved}",
+                       f"mv {b}/{name} {dst}/")
+        removed = old - cur
+        if removed and not self._dedupe("ca:removed", window=900):
+            names = [f"{x[0]}/{x[1]}" for x in sorted(removed)][:3]
+            self._bite(f"CA CERT removed from store ({', '.join(names)}) — if unexpected, "
+                       f"a MITM kit may be pruning trust", None)
+        nss = base.get("nss") or {}
+        cur_nss = {}
+        try:
+            for p in Path(os.path.expanduser("~/.pki/nssdb")).iterdir():
+                cur_nss[p.name] = int(p.stat().st_mtime)
+        except Exception:
+            pass
+        if nss and cur_nss != nss and not self._dedupe("ca:nss", window=900):
+            touched = [k for k in cur_nss if k not in nss or cur_nss[k] != nss[k]][:3]
+            self._bite(f"NSS CA STORE touched ({', '.join(touched)}) — "
+                       f"a cert may have been added for MITM", None)
+
+    def _dns_bite(self):
+        base = list(getattr(self, "_tls", {}).get("resolv") or [])
+        if not base:
+            return
+        cur = []
+        try:
+            for line in Path("/etc/resolv.conf").read_text(errors="replace").splitlines():
+                m = re.search(r"^\s*nameserver\s+(\S+)", line)
+                if m:
+                    cur.append(m.group(1))
+        except Exception:
+            return
+        if cur == base:
+            return
+        conn = self.baseline.get("conn", {})
+        linked = self._link()
+        if conn.get("ssid") and linked[0] and conn["ssid"] != linked[0]:
+            return  # legit roam — _tls_snapshot() re-blesses on roam
+        diff = [x for x in set(base) ^ set(cur)]
+        if self._dedupe("dns", window=60):
+            return
+        if self.posture == "HARVEST":
+            self._bite(f"DNS CHANGED on same network: now {', '.join(cur or ['(none)'])} "
+                       f"(was {', '.join(base)}) — WOULD restore", None)
+            return
+        tmp = self.dir / "resolv.base"
+        try:
+            tmp.write_text("# restored by raven finch\n" +
+                           "\n".join(f"nameserver {ns}" for ns in base) + "\n")
+            r = self._run(["sudo", "cp", str(tmp), "/etc/resolv.conf"])
+            ok = "restored" if (r and r.returncode == 0) else f"fail {r.returncode if r else '?'}"
+            self._bite(f"DNS CHANGED on same network ({', '.join(diff)}) — bitten: {ok}",
+                       f"cp {tmp} /etc/resolv.conf")
+        except OSError as e:
+            self._bite(f"DNS CHANGED — restore failed: {e}", None)
+
+    def _tls_pin(self):
+        if self._tls_due > time.time():
+            return
+        self._tls_due = time.time() + 120
+        if not self._gw():
+            return
+        pinned = dict(getattr(self, "_tls", {}).get("pins") or {})
+        for host in ("api.opencode.ai", "github.com", "raw.githubusercontent.com"):
+            try:
+                out = subprocess.run(
+                    ["openssl", "s_client", "-connect", host + ":443",
+                     "-servername", host, "-brief"],
+                    input=b"", capture_output=True, timeout=6).stdout
+            except Exception:
+                continue
+            subj = re.search(rb"subject=([^\n]*)", out)
+            ser = re.search(rb"serial=([^\n]*)", out)
+            iss = re.search(rb"issuer=([^\n]*)", out)
+            if not (subj and ser and iss):
+                continue
+            fp = hashlib.sha1(subj.group(1) + ser.group(1) + iss.group(1)).hexdigest()
+            old = pinned.get(host)
+            if old is None:
+                pinned[host] = fp
+                continue
+            if old != fp:
+                key = "pin:" + host
+                if not self._dedupe(key, window=900):
+                    self._bite(f"TLS PIN MISMATCH {host} — certificate chain changed since "
+                               f"baseline; the network may be intercepting TLS (MITM)", None)
+        if pinned != self._tls.get("pins"):
+            self._tls["pins"] = pinned
+            self._save(self._tls, self.tls_f)
+
+    # --- EDR-shaped layer: ptrace, new-exec, egress beacon -----------------
+    def _trace_bite(self):
+        me = os.getpid()
+        trap = 0
+        try:
+            st = (Path("/proc") / str(me) / "status").read_text(errors="replace")
+            m = re.search(r"TracerPid:\s*(\d+)", st)
+            trap = int(m.group(1)) if m else 0
+        except Exception:
+            return
+        if not trap:
+            return
+        name = self._proc_name(trap) or "?"
+        key = "trace:" + str(trap)
+        if self._dedupe(key, window=300):
+            return
+        if self.posture == "HARVEST":
+            self._bite(f"PTRACE ATTACK — {trap}/{name} is tracing raven: WOULD kill", None)
+            return
+        r = self._run(["sudo", "kill", "-9", str(trap)])
+        ok = "killed" if (r and not r.returncode) else (f"fail {r.returncode if r else '?'}")
+        self._bite(f"PTRACE ATTACK — {trap}/{name} tracing raven; bitten: kill ({ok})",
+                   f"sudo kill -9 {trap} ({name})")
+
+    def _exec_bite(self):
+        dirs = (os.path.expanduser("~/.local/bin"),
+                os.path.expanduser("~/bin"),
+                "/tmp")
+        me = os.getpid()
+        cur = {}
+        for d in dirs:
+            try:
+                for p in Path(d).iterdir():
+                    if not p.is_file() or p.is_symlink() or str(p).startswith(str(self.dir)):
+                        continue
+                    try:
+                        head = p.read_bytes()[:64]
+                    except Exception:
+                        continue
+                    if not (head.startswith(b"\x7fELF") or head.startswith(b"#!")):
+                        continue
+                    cur[str(p)] = self._hash(p)
+            except Exception:
+                pass
+        state = getattr(self, "_exec", {})
+        if state:
+            for path, h in sorted(cur.items()):
+                if state.get(path) == h:
+                    continue
+                key = "exec:" + path
+                if self._dedupe(key, window=300):
+                    continue
+                if self.posture == "HARVEST":
+                    self._bite(f"NEW EXEC {path}: WOULD quarantine (revoke exec)", None)
+                    continue
+                r = self._run(["chmod", "-x", path])
+                moved = ""
+                if path.startswith("/tmp/"):
+                    dst = self.qdir / "exec"
+                    dst.mkdir(exist_ok=True)
+                    try:
+                        shutil.move(path, str(dst / Path(path).name) + ".quar")
+                        moved = " + moved to quarantine"
+                    except OSError:
+                        moved = ""
+                ok = "revoked" if (r and not r.returncode) else (f"fail {r.returncode if r else '?'}")
+                self._bite(f"NEW EXEC {path} — bitten: exec revoked ({ok}){moved}",
+                           f"chmod -x {path}")
+        self._exec = cur
+        self._save(self._exec, self.exec_f)
+
+    def _is_private(self, ip):
+        if ip.startswith(("10.", "127.", "192.168.", "169.254.", "fe8", "fc", "fd")):
+            return True
+        if ip.startswith("172."):
+            try:
+                return 16 <= int(ip.split(".")[1]) <= 31
+            except Exception:
+                return True
+        return False
+
+    def _beacon_bite(self):
+        out = self._run(["sudo", "ss", "-tnp", "state", "established"])
+        if not out or out.returncode != 0:
+            return
+        now = time.time()
+        counts = getattr(self, "_beacon", {})
+        me = os.getpid()
+        me_name = self._proc_name(me)
+        trusted = {"python3", me_name, "node", "git", "curl", "wget", "chrome",
+                   "brave", "firefox", "ssh", "sshd", "systemd", "NetworkManager",
+                   "chronyd", "tshark", "dumpcap", "tcpdump", "airodump-ng", "opencode"}
+        for line in out.stdout.splitlines():
+            m = re.search(r"(\d+\.\d+\.\d+\.\d+):(\d+)\s+(\d+\.\d+\.\d+\.\d+):(\d+)", line)
+            if not m:
+                continue
+            r_ip, r_pr = m.group(3), m.group(4)
+            try:
+                if self._is_private(r_ip):
+                    continue
+            except Exception:
+                continue
+            pm = re.search(r'users:\(\("([^"]+)"', line)
+            name = pm.group(1) if pm else ""
+            if not name or name in trusted:
+                continue
+            pids = re.findall(r"pid=(\d+)", line)
+            dropper = False
+            for pid in pids:
+                try:
+                    cmd = self._proc_cmdline(int(pid))
+                except Exception:
+                    continue
+                if "/tmp/" in cmd or "/.local/bin" in cmd:
+                    dropper = True
+            if not dropper:
+                continue
+            key = (r_ip, r_pr, name)
+            n, _t = counts.get(key, (0, 0.0))
+            counts[key] = (n + 1, now)
+            if n + 1 < 5:
+                continue
+            bkey = "beacon:" + r_ip + ":" + name
+            if self._dedupe(bkey, window=600):
+                continue
+            if self.posture == "HARVEST":
+                self._bite(f"BEACON {name} → {r_ip}:{r_pr} (x{n + 1} in 60s) — WOULD kill", None)
+                continue
+            for pid in pids:
+                self._run(["sudo", "kill", "-9", pid])
+            self._bite(f"BEACON {name} → {r_ip}:{r_pr} (x{n + 1} in 60s) — bitten: killed",
+                       f"sudo kill -9 {' '.join(pids)} ({name})")
+        counts = {k: (n2, t2) for k, (n2, t2) in counts.items() if now - t2 <= 60}
+        self._beacon = counts
+
+    # --- IDS (suricata) feed -----------------------------------------------
+    def _ids_launch(self):
+        if not shutil.which("suricata"):
+            return
+        ids = ROOT / "ids"
+        if not (ids / "run_suricata.sh").exists():
+            return
+        try:
+            pid = (ids / "suricata.pid").read_text().strip()
+            if pid and (Path("/proc") / pid).exists():
+                return
+        except Exception:
+            pass
+        self._run(["sudo", "bash", str(ids / "run_suricata.sh")])
+        self.speak("IDS (suricata) launched on wlan0", NEON)
+
+    def _ids_bite(self):
+        f = ROOT / "ids" / "eve.json"
+        if not f.exists():
+            return
+        try:
+            sz = f.stat().st_size
+            off = getattr(self, "_ids_off", 0)
+            if sz < off:
+                off = 0
+            with open(f, "rb") as fh:
+                fh.seek(off)
+                new = fh.read() if sz > off else b""
+            self._ids_off = sz
+        except Exception:
+            return
+        for line in new.splitlines():
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            if e.get("event_type") != "alert":
+                continue
+            a = e.get("alert") or {}
+            src = e.get("src_ip", "?")
+            dst = e.get("dest_ip", "?")
+            sig = a.get("signature") or "suricata alert"
+            key = f"ids:{src}->{dst}:{a.get('signature_id')}:{sig[:24]}"
+            if self._dedupe(key, window=300):
+                continue
+            if self.posture == "HARVEST":
+                self._bite(f"IDS {sig} — {src}→{dst}: WOULD block at firewall", None)
+                continue
+            self._block_ip(src, f"IDS {sig}")
+
+    def _block_ip(self, ip, why):
+        if not ip or ip == "?" or ip == self._gw() or self._is_private(ip):
+            return
+        if ip in self._drops:
+            return
+        r = self._run(["sudo", "iptables", "-I", "OUTPUT", "-d", ip, "-j", "DROP"])
+        r2 = self._run(["sudo", "iptables", "-I", "INPUT", "-s", ip, "-j", "DROP"])
+        ok = "blocked" if ((r and not r.returncode) or (r2 and not r2.returncode)) else "fail"
+        self._drops[ip] = {"why": why, "at": time.strftime("%H:%M:%S")}
+        self._save(self._drops, self.drops_f)
+        self._bite(f"IDS — firewall drop {ip} [{why}] ({ok})",
+                   f"iptables -I OUTPUT -d {ip} -j DROP")
+
+    def unblock_ids(self):
+        n = len(self._drops)
+        for ip in list(self._drops):
+            self._run(["sudo", "iptables", "-D", "OUTPUT", "-d", ip, "-j", "DROP"])
+            self._run(["sudo", "iptables", "-D", "INPUT", "-s", ip, "-j", "DROP"])
+        self._drops = {}
+        self._save(self._drops, self.drops_f)
+        self.speak(f"IDS firewall drops flushed (released {n} IPs)", NEON)
 
     # --- ledger -----------------------------------------------------------
     def export_ledger(self):

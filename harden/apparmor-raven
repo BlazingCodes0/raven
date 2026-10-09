@@ -1,0 +1,57 @@
+# raven / finch hardening profile — COMPLAIN mode (logs denials, blocks nothing).
+# Flip flags=(complain) to flags=(enforce) ONLY after reviewing /var/log/audit
+# or dmesg for one full day of normal operation, or you may break raven+twin.
+#include <tunables/global>
+
+profile raven /home/a/raven/app.py flags=(complain) {
+  #include <abstractions/base>
+  #include <abstractions/nameservice>
+  #include <abstractions/openssl>
+  #include <abstractions/python>
+
+  owner @{HOME}/raven/** rw,
+  owner @{HOME}/.ravenheart/** rw,
+  owner @{HOME}/.ravenheart/sync/** rw,
+  owner @{HOME}/finch/** rw,
+  /home/a/raven/ids/** rw,
+  /tmp/ravenheart/** rw,
+  @{HOME}/.ravenheart/quarantine/** rw,
+  @{HOME}/.local/share/kali/** r,
+
+  network inet stream,
+  network inet dgram,
+  network inet6 stream,
+  network inet6 dgram,
+  network raw,
+  network packet,
+
+  /usr/bin/* ix,
+  /usr/sbin/* ix,
+  /usr/local/bin/* ix,
+  /bin/* ix,
+  /sbin/* ix,
+  /usr/lib/python3*/** rmix,
+  @{HOME}/.opencode/** rwix,
+
+  /etc/resolv.conf rw,
+  /etc/ssl/certs/** r,
+  /etc/xdg/autostart/** r,
+  @{HOME}/.config/autostart/** rw,
+  /sys/class/net/** r,
+  /sys/devices/** r,
+  /proc/** r,
+  /dev/video* rw,
+  /dev/input/** rw,
+
+  capability sys_ptrace,
+  capability net_raw,
+  capability net_admin,
+  capability sys_chroot,
+
+  ptrace (trace, read),
+  signal (send, receive),
+
+  deny @{HOME}/.ssh/* w,
+  deny /etc/shadow w,
+  deny /etc/sudoers w,
+}
