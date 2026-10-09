@@ -5686,11 +5686,12 @@ class FinchPane(QWidget):
         self.ledger_f = self.dir / "BITE_REPORT.txt"
         self.baseline = self._load(self.base_f)
         self.whitelist = self._load(self.wl_f)
-        self.posture = "HARVEST"
+        self.posture = "BITE"
         self.bites = 0
         self.armed = False
         self.t0 = 0.0
         self._seen = {}
+        self._ledger = []
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -5703,12 +5704,10 @@ class FinchPane(QWidget):
         row.addStretch(1)
         self.posture_box = QComboBox()
         self.posture_box.addItems(self.POSTURES)
+        self.posture_box.setCurrentText("BITE")
         self.posture_box.setToolTip("HARVEST=watch only · PECK=heal own gear · BITE=active bite-back")
         self.posture_box.currentTextChanged.connect(self._set_posture)
         row.addWidget(self.posture_box)
-        self.btn_arm = QPushButton("ARM FINCH")
-        self.btn_arm.clicked.connect(self.arm)
-        row.addWidget(self.btn_arm)
         self.btn_bless = QPushButton("SAVE WHITELIST")
         self.btn_bless.clicked.connect(self.bless_whitelist)
         row.addWidget(self.btn_bless)
@@ -5725,9 +5724,9 @@ class FinchPane(QWidget):
         self.tick = QTimer(self)
         self.tick.timeout.connect(self._poll)
         self.tick.start(4000)
-        self.speak("the vampire finch wakes with you — ARM to baseline the net, then pick a posture: "
-                   "HARVEST watches, PECK heals your own gear, BITE bites back",
-                   CRIMSON)
+        self.speak("the vampire finch is on the wing — auto-armed, posture BITE, "
+                   "ready to defend and bite back", CRIMSON)
+        QTimer.singleShot(1000, self.arm)
 
     # --- basics -----------------------------------------------------------
     def _load(self, path):
@@ -5755,7 +5754,11 @@ class FinchPane(QWidget):
         self.speak(msg, CRIMSON)
         self.report("FINCH BITE — " + msg)
         if action:
+            if not hasattr(self, "_ledger"):
+                self._ledger = []
             self._ledger.append(action)
+            if len(self._ledger) > 500:
+                del self._ledger[:-500]
 
     def _dedupe(self, key, window=60):
         t = time.time()
@@ -5859,6 +5862,17 @@ class FinchPane(QWidget):
 
     # --- arm / whitelist --------------------------------------------------
     def arm(self):
+        self._seed_ref()
+        self.armed = True
+        self.t0 = time.time()
+        self.bites = 0
+        self.status.setText(f"{self.posture} · bites {self.bites} · auto-armed")
+        self.speak("FINCH ON THE WING — field reference seeded"
+                   f" (neigh {len(self.baseline['neigh'])}, dev {self.baseline['dev']}),"
+                   f" posture {self.posture}; biting on sight.",
+                   CRIMSON)
+
+    def _seed_ref(self):
         aps = self._aps()
         iw_ssid, iw_bssid = self._link()
         conn = next((a for a in aps if a["inuse"]), None)
@@ -5877,16 +5891,16 @@ class FinchPane(QWidget):
             },
         }
         self._save(self.baseline, self.base_f)
-        self.armed = True
-        self.t0 = time.time()
         self._seen.clear()
-        self.bites = 0
-        self.btn_arm.setText("FINCH ARMED · RE-ARM re-baselines")
-        self.status.setText(f"{self.posture} · bites {self.bites}")
-        self.speak("FINCH ARMED — baseline captured"
-                   f" (neigh {len(self.baseline['neigh'])}, dev {self.baseline['dev']}),"
-                   f" posture {self.posture}. learning window 8s.",
-                   CRIMSON)
+        return self.baseline
+
+    def _rearm_if_roamed(self):
+        conn = self.baseline.get("conn", {})
+        cur = next((a for a in self._aps() if a["inuse"]), None)
+        if cur and cur.get("ssid") and cur.get("ssid") != conn.get("ssid"):
+            self.speak(f"roamed {conn.get('ssid') or '?'} → {cur['ssid']} — "
+                       f"re-seeding field reference (no stale baseline)", CRIMSON)
+            self._seed_ref()
 
     def _set_posture(self, p):
         if p not in self.POSTURES:
@@ -5915,8 +5929,8 @@ class FinchPane(QWidget):
     def _poll(self):
         if not self.armed:
             return
-        self._ledger = []
         try:
+            self._rearm_if_roamed()
             base = self.baseline
             self._arp_bite(base)
             self._persist_bite(base)
@@ -5926,8 +5940,8 @@ class FinchPane(QWidget):
             if self.posture == "BITE":
                 self._grab_bite()
             self.status.setText(f"{self.posture} · bites {self.bites}")
-        finally:
-            del self._ledger
+        except Exception as e:
+            self.speak(f"finch poll error: {e!r}", CRIMSON)
 
     def _arp_bite(self, base):
         neigh = self._neigh()
