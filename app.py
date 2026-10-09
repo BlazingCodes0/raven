@@ -3187,6 +3187,15 @@ def shout(cmd, timeout=7):
         return ""
 
 
+def run_argv(argv, timeout=7):
+    # no /bin/sh between us and the tool — one fork instead of two, every beat
+    try:
+        return subprocess.run(argv, timeout=timeout, text=True,
+                              capture_output=True).stdout.strip()
+    except Exception:
+        return ""
+
+
 def ev(tag, msg):
     line = "[%s] %s: %s\\n" % (time.strftime("%H:%M:%S"), tag, msg)
     for path in (LEDGER, MIRROR + "/events.log"):
@@ -3229,12 +3238,27 @@ def dump(path, data):
         return False
 
 
+_MEMO = {}
+
+
+def _memo(key, ttl, fn):
+    # control files are human-driven; re-reading + parsing them ~4x per beat is
+    # pure churn. Cache for < one beat so a button press is still seen promptly.
+    now = time.time()
+    ent = _MEMO.get(key)
+    if ent and now - ent[0] < ttl:
+        return ent[1]
+    val = fn()
+    _MEMO[key] = (now, val)
+    return val
+
+
 def survival_on():
     # the mirror is the single source of truth — wiping /tmp does not disarm it
-    return bool(load(MCONTROL).get("survival"))
+    return bool(_memo("surv", 1.0, lambda: load(MCONTROL).get("survival")))
 
 
-def ctl():
+def _ctl_load():
     base = {"auto": True, "resurrect": True, "guard": True,
             "aggressive": True, "opencode": True, "survival": False,
             "threshold": 2}
@@ -3248,8 +3272,12 @@ def ctl():
     return base
 
 
+def ctl():
+    return _memo("ctl", 1.0, _ctl_load)
+
+
 def route():
-    out = shout("ip route show default").split()
+    out = run_argv(["ip", "route", "show", "default"]).split()
     dev = gw = None
     if "dev" in out:
         dev = out[out.index("dev") + 1]
@@ -3276,7 +3304,7 @@ def online():
 
 
 def rtt_ms(host="1.1.1.1"):
-    out = shout("ping -q -c 1 -W 2 %s" % shlex.quote(host))
+    out = run_argv(["ping", "-q", "-c", "1", "-W", "2", host])
     try:
         return round(float(out.split("= ")[-1].split("/")[0]), 1)
     except Exception:
@@ -3386,29 +3414,42 @@ LAIR = RUNTIME + "/lair"
 
 
 def pscan():
+    # only the command line is needed every beat; uid/ppid are pulled lazily
+    # (proc_meta) for the handful of processes that actually match a token.
     procs = {}
     for d in os.listdir("/proc"):
         if not d.isdigit():
             continue
-        base = "/proc/" + d
         try:
-            with open(base + "/cmdline", "rb") as f:
+            with open("/proc/" + d + "/cmdline", "rb") as f:
                 cmd = f.read().replace(b"\\0", b" ").decode("utf-8", "replace").strip()
-            uid = "?"
-            ppid = 0
-            try:
-                with open(base + "/status") as f:
-                    for ln in f:
-                        if ln.startswith("Uid:"):
-                            uid = ln.split()[1]
-                        elif ln.startswith("PPid:"):
-                            ppid = int(ln.split()[1])
-            except Exception:
-                pass
-            procs[int(d)] = {"cmd": cmd, "uid": uid, "ppid": ppid}
+            procs[int(d)] = {"cmd": cmd}
         except Exception:
             continue
     return procs
+
+
+_PROC_META = {}
+
+
+def proc_meta(pid):
+    now = time.time()
+    ent = _PROC_META.get(pid)
+    if ent and now - ent[0] < 1.0:
+        return ent[1]
+    uid, ppid = "?", 0
+    try:
+        with open("/proc/%d/status" % pid) as f:
+            for ln in f:
+                if ln.startswith("Uid:"):
+                    uid = ln.split()[1]
+                elif ln.startswith("PPid:"):
+                    ppid = int(ln.split()[1])
+    except Exception:
+        pass
+    val = (uid, ppid)
+    _PROC_META[pid] = (now, val)
+    return val
 
 
 def trusted(pid, procs):
@@ -3417,13 +3458,16 @@ def trusted(pid, procs):
     while pid and pid not in seen:
         seen.add(pid)
         info = procs.get(pid)
-        if not info:
+        if info is None:
             return False
         cmd = info.get("cmd", "")
         for r in TRUSTED_ROOTS:
             if r in cmd:
                 return True
-        pid = info.get("ppid", 0)
+        try:
+            pid = proc_meta(pid)[1]
+        except Exception:
+            return False
     return False
 
 
@@ -3773,17 +3817,21 @@ def guardian():
         cmd = info["cmd"]
         if not cmd:
             continue
+        cls = tok = ""
+        for t in EXPELLED:
+            if t in cmd:
+                cls, tok = "EXPEL", t
+                break
+        if not cls:
+            for t in WATCHED:
+                if t in cmd:
+                    cls, tok = "WATCH", t
+                    break
+        if not cls:
+            continue
         if trusted(pid, ps):
             continue
-        for tok in EXPELLED:
-            if tok in cmd:
-                handle(pid, cmd, "EXPEL", tok, info["uid"])
-                break
-        else:
-            for tok in WATCHED:
-                if tok in cmd:
-                    handle(pid, cmd, "WATCH", tok, info["uid"])
-                    break
+        handle(pid, cmd, cls, tok, proc_meta(pid)[0])
     OFF = {k: v for k, v in OFF.items() if k in ps}
     integrity_scan()
     respawn_guard(ps)
@@ -3810,18 +3858,8 @@ def respawn_guard(ps):
                                  stderr=subprocess.DEVNULL)
             except Exception as ex:
                 ev("ERR", "respawn app failed: %r" % ex)
-    if c.get("opencode", True) and not any(".opencode/bin/opencode" in p["cmd"] for p in ps.values()):
-        if now - LAST_TIMES["oc"] > 60:
-            LAST_TIMES["oc"] = now
-            ev("ACT", "opencode engine missing — relaunching it")
-            try:
-                oc = os.path.expanduser("~/.opencode/bin/opencode")
-                if os.path.exists(oc):
-                    subprocess.Popen([oc, "web"], start_new_session=True,
-                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                     stderr=subprocess.DEVNULL)
-            except Exception as ex:
-                ev("ERR", "respawn opencode failed: %r" % ex)
+    # NOTE: opencode is the operator's quicklaunch helper, not part of the host's
+    # lifeline. The twin must never spend cycles (or open browser tabs) respawning it.
 
 
 # ── SURVIVAL: the twin locks itself down and spawns the second heart ─────────
@@ -3966,9 +4004,14 @@ def main():
             c = ctl()
             # AUTO RESURRECT: ping the bearer every beat; armed = ping + fix itself
             armed = bool(c.get("auto", True)) and bool(c.get("resurrect", True))
-            rtt = rtt_ms()                       # one real ICMP ping, every beat
-            pinged = rtt is not None
-            heartbeat = online() or pinged
+            # probe the WAN only when auto-resurrect can act on the answer; when
+            # it's off, "up" is local route presence and we send no packets.
+            if armed:
+                rtt = rtt_ms()                   # one real ICMP ping, every beat
+                heartbeat = (rtt is not None) or online()
+            else:
+                rtt = None
+                heartbeat = bool(dev)
             gd = guardian()
             surv = survival_on()
             if heartbeat:
