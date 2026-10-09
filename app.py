@@ -3340,6 +3340,12 @@ ALLOW = ("raven/app.py", "ravenheart.py", "/.opencode/bin/opencode",
          "NetworkManager", "avahi-daemon", "sshd", "dbus-daemon", "polkitd",
          "chronyd", "timesyncd", "udisksd", "systemd-logind", "accounts-daemon")
 
+# Anything spawned by Raven itself (its tshark/dumpcap captures, scans, crow
+# tasks) is Raven's own gear — never an intruder. Matching by ancestor command
+# keeps a student's standalone tshark watched while leaving ours alone.
+TRUSTED_ROOTS = ("raven/app.py", "ravenheart.py", "/.opencode/bin/opencode",
+                 "opencode web", "opencode serve", "opencode tui")
+
 EXPELLED = (
     "xwd ", " scrot ", "maim ", " grim ", "grimscape", "flameshot", "spectacle",
     "import -window", "import -screen", "x11vnc", "vncserver", "xvnc", "vino",
@@ -3389,18 +3395,36 @@ def pscan():
             with open(base + "/cmdline", "rb") as f:
                 cmd = f.read().replace(b"\\0", b" ").decode("utf-8", "replace").strip()
             uid = "?"
+            ppid = 0
             try:
                 with open(base + "/status") as f:
                     for ln in f:
                         if ln.startswith("Uid:"):
                             uid = ln.split()[1]
-                            break
+                        elif ln.startswith("PPid:"):
+                            ppid = int(ln.split()[1])
             except Exception:
                 pass
-            procs[int(d)] = {"cmd": cmd, "uid": uid}
+            procs[int(d)] = {"cmd": cmd, "uid": uid, "ppid": ppid}
         except Exception:
             continue
     return procs
+
+
+def trusted(pid, procs):
+    # walk the ancestor chain; a descendant of Raven/opencode is Raven's own tool
+    seen = set()
+    while pid and pid not in seen:
+        seen.add(pid)
+        info = procs.get(pid)
+        if not info:
+            return False
+        cmd = info.get("cmd", "")
+        for r in TRUSTED_ROOTS:
+            if r in cmd:
+                return True
+        pid = info.get("ppid", 0)
+    return False
 
 
 def kill_proc(pid, uid):
@@ -3472,6 +3496,26 @@ def checksum(path):
             return hashlib.sha256(f.read()).hexdigest()
     except Exception:
         return None
+
+
+STAT_CACHE = {}
+
+
+def checksum_cached(path):
+    # the beat is 2s; re-reading+hashing app.py/ravenheart.py every beat is pure
+    # IO/CPU burn. Fingerprint on (mtime_ns, size) and only re-hash on change.
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = (int(st.st_mtime_ns), int(st.st_size))
+    ent = STAT_CACHE.get(path)
+    if ent is not None and ent[0] == key:
+        return ent[1]
+    h = checksum(path)
+    if h is not None:
+        STAT_CACHE[path] = (key, h)
+    return h
 
 
 def dir_snap(d):
@@ -3692,13 +3736,13 @@ def integrity_scan():
             backup(os.path.expanduser(p))
     for p in CORE_FILES + LATCH_FILES:
         p = os.path.expanduser(p)
-        cur = checksum(p)
+        cur = checksum_cached(p)
         base = INTEGRITY.get(p)
         if cur is None:
             continue
         if base and cur != base:
             if copy_in(p):
-                INTEGRITY[p] = checksum(p)
+                INTEGRITY[p] = checksum_cached(p)
                 ev("EXPEL", "hand rewrote %s — restored from the twin's copy" % p)
             else:
                 ev("ALERT", "tampered %s and restore failed" % p)
@@ -3706,7 +3750,7 @@ def integrity_scan():
             INTEGRITY.setdefault(p, cur)
     for p in SUSPECT_FILES:
         p = os.path.expanduser(p)
-        cur = checksum(p)
+        cur = checksum_cached(p)
         base = INTEGRITY.get(p)
         if base and cur != base:
             ev("WATCH", "someone rewrote %s (not restored — operator owns their dotfiles)" % p)
@@ -3728,6 +3772,8 @@ def guardian():
     for pid, info in ps.items():
         cmd = info["cmd"]
         if not cmd:
+            continue
+        if trusted(pid, ps):
             continue
         for tok in EXPELLED:
             if tok in cmd:
@@ -5093,10 +5139,16 @@ class DyePane(QWidget):
         prefix = mac.replace(":", "-").upper()[:8]
         return self.oui.get(prefix, "")
 
+    # kernel-side BPF capture filter so tshark never parses the whole link in
+    # userspace — matches the display filter below (arp/dhcp/dns/nbns/mdns/tls).
+    WATCH_CAP = ("arp or udp port 53 or udp port 67 or udp port 68 "
+                 "or udp port 137 or udp port 5353 or tcp port 443")
+
     def _watch_bin(self):
         iface = default_iface()
         return [
             "tshark", "-l", "-i", iface, "-a", "duration:25",
+            "-f", self.WATCH_CAP,
             "-Y", "arp or bootp or mdns or nbns or tls.handshake.extensions_server_name",
             "-T", "fields",
             "-e", "frame.time", "-e", "eth.src", "-e", "arp.src.hw_mac", "-e", "ip.src",
