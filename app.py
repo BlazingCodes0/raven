@@ -1603,7 +1603,7 @@ CROW_ROLES = {
                  "DNS and TLS SNI. transmits nothing. sees what devices broadcast, not encrypted screen content.",
         "tasks": [
             ("ensure mdns daemon is up", "sudo -n systemctl start avahi-daemon"),
-            ("arp sweep — find the phone", "sudo -n arp-scan --localnet"),
+            ("arp sweep — find the phone", "sudo -n arp-scan -I {iface} --localnet --retry 2 --timeout 500"),
             ("mdns service browse (cast/airplay/spotify)", "avahi-browse -a -t -r"),
             ("phone service scan", "nmap -Pn -sV --top-ports 100 {target} -oA {outdir}/{name}_phone"),
             ("listen: casting & service announcements (45s)", "tshark -i {iface} -a duration:45 -l -Y 'mdns or ssdp or llmnr' -T fields -e frame.time -e ip.src -e _ws.col.Protocol -e _ws.col.Info"),
@@ -1618,7 +1618,7 @@ CROW_ROLES = {
                  "and a deep capture, then a color-coded triage verdict with the decision to act on.",
         "tasks": [
             ("ensure mdns daemon is up", "sudo -n systemctl start avahi-daemon"),
-            ("arp sweep — who is actually here", "sudo -n arp-scan --localnet"),
+            ("arp sweep — who is actually here", "sudo -n arp-scan -I {iface} --localnet --retry 2 --timeout 500"),
             ("network inventory — live hosts", "nmap -sn -PR -PS22,80,443,5353 {target} -oA {outdir}/{name}_eyes_live"),
             ("full-segment service probe", "nmap -Pn -sV --top-ports 200 {target} -oA {outdir}/{name}_eyes_ports"),
             ("casting/named services (mdns browse)", "avahi-browse -a -t -r"),
@@ -2163,6 +2163,7 @@ class CrowPane(QWidget):
             "target": target,
             "tasks": tasks or list(CROW_ROLES[role]["tasks"]),
             "task_states": [TASK_PENDING] * (len(tasks or []) or len(CROW_ROLES[role]["tasks"])),
+            "exit_codes": [],
             "state": TASK_PENDING,
         }
         self.crows.append(crow)
@@ -2402,9 +2403,12 @@ class CrowPane(QWidget):
         view.append(f"\n[exit {code}]\n")
         dur = time.monotonic() - self.task_started if self.task_started else 0
         state = TASK_DONE if code == 0 else TASK_FAILED
+        while len(crow["exit_codes"]) <= self.task_idx:
+            crow["exit_codes"].append(None)
+        crow["exit_codes"][self.task_idx] = code
         view.mark_task(self.task_idx, state)
         view.refresh_findings()
-        self.log(f"[crow:{crow['name']}] task {self.task_idx + 1} {state} in {dur:.1f}s")
+        self.log(f"[crow:{crow['name']}] task {self.task_idx + 1} {state} in {dur:.1f}s (exit {code})")
         if crow["state"] != TASK_RUNNING:
             return
         self.task_idx += 1
@@ -2510,7 +2514,11 @@ def save_crow_report(crow, view, log):
         lines.append(f"role: {crow['role']}   target: {crow['target']}")
         for i, (label, _) in enumerate(crow["tasks"], 1):
             st = crow["task_states"][i - 1]
-            lines.append(f"  task {i:02d} [{st}] {label}")
+            ex = ""
+            if crow.get("exit_codes") and i - 1 < len(crow["exit_codes"]):
+                ex = crow["exit_codes"][i - 1]
+                ex = f"  (exit {ex})" if ex is not None else "  (not run)"
+            lines.append(f"  task {i:02d} [{st}]{ex} {label}")
         brief = view.brief.toPlainText().strip()
         if brief:
             lines.append("")
@@ -2525,9 +2533,11 @@ def save_crow_report(crow, view, log):
                 lines.append("  " + b)
         out = (view.crow.get("buf") or view.out.toPlainText()).strip()
         if out:
+            failed = any(s == TASK_FAILED for s in crow["task_states"])
+            tail = None if failed else 60
             lines.append("")
-            lines.append("TRANSCRIPT (tail 60 lines)")
-            for b in out.splitlines()[-60:]:
+            lines.append("TRANSCRIPT (full)" if failed else "TRANSCRIPT (tail 60 lines)")
+            for b in out.splitlines()[-tail:] if tail else out.splitlines():
                 lines.append("  " + b)
         path.write_text("\n".join(lines), encoding="utf-8", errors="replace")
         log(f"[crow:{name}] evidence saved to {path.name}")
