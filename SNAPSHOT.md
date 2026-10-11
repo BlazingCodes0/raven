@@ -9,7 +9,7 @@
 
 - **Single file:** `/home/a/raven/app.py`; PyQt6, one shared `QProcess`, global
   f-string `STYLE` (braces doubled `{{ }}`).
-- **Tabs:** Dashboard, Recon, Birdshit, Learn, Crow, Lifeline, Modules, OpenCode, Logs, Settings.
+- **Tabs:** Dashboard, Recon, Birdshit, Learn, Crow, Dye, Shield, Finch, Systemwatch, Lifeline, Modules, OpenCode, Logs, Settings.
 - **Restart:** `setsid nohup python3 /home/a/raven/app.py > /tmp/opencode/raven.log 2>&1 < /dev/null &`
   then `pgrep -a python3 | grep raven`. Startup ~8s.
 - **Shell gotcha:** `pkill -f "raven/app.py"` also matches the invoking zsh and
@@ -353,3 +353,40 @@ FINDINGS chips row under each crow = raw IPs/domains from output, click to copy
 - Wants honest framing of what's sniffable vs encrypted — never overclaim.
 - Answers should be short; when he says "read you restart" → verify `pgrep`,
   check `/tmp/opencode/raven.log`, headless-smoke-test the Crow page.
+
+## WIP — 2026-10-11 (active ARP defense + systemwatch)
+
+- **`arpguard.py`** (new, root) — active *host-local* layer-2 defense, the hand
+  behind `arpsentry`'s eye. Sets kernel knobs (`arp_ignore=1 arp_announce=2
+  rp_filter=1` on all/default/dev), writes the gateway + every known-good
+  neighbour as a **PERMANENT** neighbour entry (the kernel will not re-learn a
+  poisoned MAC), and installs a `RAVENGUARD` arptables chain in INPUT that drops
+  ARP replies claiming a pinned IP from a MAC that doesn't own it, plus a
+  per-attacker block. Everything runs through `sudo -n` (NOPASSWD). It never sends
+  a packet — only drops frames arriving at our own NIC and pins our own cache.
+  CLI: `arm | disarm | status | install | pin IP MAC | unpin IP | block IP MAC`.
+- **Finch now uses it (this was the real bug):** `_arp_bite`/`_hop_bite` no longer
+  do a bare `ip neigh replace` — that call silently died with `Operation not
+  permitted` because it lacked sudo, so a spoof was *never* actually stopped. They
+  call `_arp_restore()` -> `arpguard.pin(...)` (sudo, `nud permanent`) +
+  `arpguard.block()` (drop the liar's replies). `FinchPane.arm()` calls
+  `arpguard.arm()` up front (pins the map, hooks the drops).
+- **_surge() now returns to the TRUSTED network** (the `trusted_ssid` on the finch
+  baseline) instead of "first active wireless", which could only ever rejoin the
+  current/hotspot AP. Ladder: saved profile == SSID -> profile containing SSID ->
+  `nmcli dev wifi connect <ssid>` (stored key) -> any saved wireless -> active.
+- **Baseline capture hardened (shield + finch):** an offline / blip re-arm no
+  longer seeds an empty reference (`conn_ssid:""`, `gateway:null` made ARP/twin
+  checks blind). Both keep the last trusted SSID/BSSID from the prior baseline and
+  record a persistent `trusted_ssid`.
+- **SYSTEMWATCH tab** (`SystemwatchPane` + root `systemwatch.py`, user unit
+  `~/.config/systemd/user/systemwatch.service`): lean read-only whole-host eye —
+  a `/proc` walk for injection tells (TracerPid, LD_PRELOAD, exec from /tmp,
+  deleted exe) + kernel inotify (ctypes) over keys/config/raven files/autostart.
+  Dormant until ARM; log `~/.ravenheart/events.systemwatch.log`. Finch quarantine
+  is now content-hash deduped + bounded (25 files / 100 MB, oldest evicted).
+- **Verify:** `python3 -u /tmp/opencode/test_arpguard_wiring.py` -> 5/5 (arpguard
+  imported; shield+finch keep the trusted ssid while offline; `_surge` ups /
+  rejoins the trusted SSID). `py_compile` clean.
+- **State:** raven down, survival off. Host arpguard rules are **not** currently
+  armed (a reboot cleared them) — finch re-arms them on its next start.

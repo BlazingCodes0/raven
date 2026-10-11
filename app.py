@@ -34,6 +34,11 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+try:
+    import arpguard          # active local ARP guard (sudo -n): permanent pins + RAVENGUARD drops
+except Exception:
+    arpguard = None
+
 ROOT = Path(__file__).parent
 
 BLACK = "#000000"
@@ -5610,14 +5615,22 @@ class ShieldPane(QWidget):
 
     # --- arm / poll -------------------------------------------------------
     def arm(self):
+        prev = self.baseline or {}
         self.baseline = {}
         self.baseline["at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         self.baseline["neigh"] = self._neigh()
         self.baseline["gateway"] = self._gateway()
         self.baseline["aps"] = self._aps()
         self.conn_ssid, self.conn_bssid = self._link()
+        # if we're momentarily offline, don't seed an empty reference — keep the
+        # last link we trusted so ARP/twin checks aren't blind after a blip
+        if not self.conn_ssid:
+            self.conn_ssid = prev.get("conn_ssid") or prev.get("trusted_ssid")
+        if not self.conn_bssid:
+            self.conn_bssid = prev.get("conn_bssid")
         self.baseline["conn_ssid"] = self.conn_ssid
         self.baseline["conn_bssid"] = self.conn_bssid
+        self.baseline["trusted_ssid"] = self.conn_ssid
         self.baseline["listeners"] = self._listeners()
         self.baseline["autostart"] = sorted(self._autostart_files())
         self.baseline["code"] = {
@@ -5761,6 +5774,125 @@ class ShieldPane(QWidget):
         except OSError as e:
             self.speak(f"report failed: {e}", SEV_CRIT)
             return None
+
+
+class SystemwatchPane(QWidget):
+    """SYSTEMWATCH — raven's whole-host eye.
+
+    Two cheap, read-only watches on THIS machine:
+      * injection / hiding — a tracer attached to a process, LD_PRELOAD forced
+        in, or an executable running from /tmp, /dev/shm or replaced under a
+        live pid;
+      * file access — opens/reads/writes/deletes on keys, config, raven's own
+        files and autostart, via the kernel's inotify (no packages).
+
+    Dormant by default — a standby eye until you ARM it, and it stops the moment
+    you stand it down. It is a systemd --user service, so mr.fluffy's wire can
+    arm the exact same eye when you fly the network. Everything it reports is
+    local; it never touches the wire.
+    """
+
+    LOG = Path.home() / ".ravenheart" / "events.systemwatch.log"
+    UNIT = "systemwatch.service"
+
+    def __init__(self, log, report):
+        super().__init__()
+        self.log = log
+        self.report = report
+        self._pos = 0
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.status = QLabel("standby")
+        self.status.setStyleSheet(f"color: {MUTED}; font-size: 12px;")
+        row.addWidget(self.status)
+        row.addStretch(1)
+        self.btn_arm = QPushButton("ARM SYSTEMWATCH")
+        self.btn_arm.clicked.connect(self.arm)
+        row.addWidget(self.btn_arm)
+        self.btn_down = QPushButton("STAND DOWN")
+        self.btn_down.setObjectName("ghost")
+        self.btn_down.clicked.connect(self.standby)
+        row.addWidget(self.btn_down)
+        self.btn_clear = QPushButton("CLEAR")
+        self.btn_clear.setObjectName("ghost")
+        self.btn_clear.clicked.connect(self.clear)
+        row.addWidget(self.btn_clear)
+        lay.addLayout(row)
+
+        self.view = QPlainTextEdit()
+        self.view.setReadOnly(True)
+        self.view.document().setMaximumBlockCount(4000)
+        self.view.setPlaceholderText("systemwatch is dormant — ARM to open the eye")
+        lay.addWidget(self.view)
+
+        self.tick = QTimer(self)
+        self.tick.timeout.connect(self._poll)
+        self.tick.start(3000)
+        self._poll()
+
+    # --- controls ---------------------------------------------------------
+    def _systemctl(self, *args):
+        try:
+            return subprocess.run(["systemctl", "--user", *args],
+                                  capture_output=True, text=True, timeout=6).stdout.strip()
+        except Exception:
+            return ""
+
+    def _active(self):
+        return self._systemctl("is-active", self.UNIT) == "active"
+
+    def arm(self):
+        self._systemctl("start", self.UNIT)
+        self.speak("ARMED — the eye is open (injection + file access)", SEV_INFO)
+        self._poll()
+
+    def standby(self):
+        self._systemctl("stop", self.UNIT)
+        self.speak("stood down — dormant again", SEV_INFO)
+        self._poll()
+
+    def clear(self):
+        self.view.clear()
+        self._pos = 0
+
+    def speak(self, line, color=None):
+        if color:
+            self.view.appendHtml(f'<span style="color:{color};">{html.escape(line)}</span>')
+        else:
+            self.view.appendPlainText(line)
+        self.log("[systemwatch] " + line)
+
+    # --- status + tail ----------------------------------------------------
+    def _poll(self):
+        active = self._active()
+        self.status.setText(("eye open · watching the whole host" if active
+                             else "standby · dormant") + f"   [{self.UNIT}]")
+        self.status.setStyleSheet(f"color: {NEON if active else MUTED}; font-size: 12px;")
+        self._tail()
+
+    def _tail(self):
+        try:
+            size = self.LOG.stat().st_size
+        except OSError:
+            return
+        if size < self._pos:            # rotated or truncated
+            self._pos = 0
+        if size == self._pos:
+            return
+        try:
+            with open(self.LOG, "r", errors="replace") as f:
+                f.seek(self._pos)
+                data = f.read()
+                self._pos = f.tell()
+        except OSError:
+            return
+        for line in data.splitlines():
+            loud = "FILE!" in line or "INJECT?" in line
+            self.speak(line, SEV_CRIT if loud else None)
 
 
 class FinchPane(QWidget):
@@ -5986,6 +6118,7 @@ class FinchPane(QWidget):
     # --- arm / whitelist --------------------------------------------------
     def arm(self):
         self._seed_ref()
+        self._arp_arm()
         self._tls_snapshot()
         self._ids_launch()
         self.armed = True
@@ -5997,17 +6130,50 @@ class FinchPane(QWidget):
                    f" posture {self.posture}; biting on sight.",
                    CRIMSON)
 
+    # --- active ARP guard (the hand behind arpsentry's eye) ---------------
+    def _arp_restore(self, ip, mac, dev, attacker=None):
+        """Hold an honest neighbour with a PERMANENT pin (sudo) and, when we know
+        the liar, drop its forged replies. Returns a short status string."""
+        if arpguard is None:
+            return "no arpguard"
+        bits = ["pinned" if arpguard.pin(ip, mac, dev) else "pin failed"]
+        if attacker and attacker != mac:
+            bits.append("attacker dropped" if arpguard.block(dev, ip, attacker) else "block failed")
+        return ", ".join(bits)
+
+    def _arp_arm(self):
+        """Pin the known-good map and install the RAVENGUARD drops up front."""
+        if arpguard is None:
+            self.speak("arpguard not importable — ARP restore runs without sudo pinning", CRIMSON)
+            return
+        try:
+            rep = arpguard.arm()
+            self.speak(f"arpguard armed — gw {rep.get('gateway')} pinned, "
+                       f"{len(rep.get('pinned', {}))} neighbours held, "
+                       f"{rep.get('rules')} RAVENGUARD drop(s)", CRIMSON)
+        except Exception as e:
+            self.speak(f"arpguard arm failed: {e!r}", CRIMSON)
+
     def _seed_ref(self):
+        prev = self.baseline or {}
         aps = self._aps()
         iw_ssid, iw_bssid = self._link()
         conn = next((a for a in aps if a["inuse"]), None)
         if not conn and iw_bssid:
             conn = {"bssid": iw_bssid, "ssid": iw_ssid or "?", "inuse": True}
+        if not conn:
+            # momentarily offline — keep the last link we trusted rather than
+            # seeding an empty reference (else surge/twin checks go blind)
+            conn = prev.get("conn", {}) or {}
+        trusted = conn.get("ssid") or prev.get("trusted_ssid")
+        if trusted == "?":
+            trusted = prev.get("trusted_ssid")
         self.baseline = {
             "at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "neigh": self._neigh(),
             "dev": self._linkdev(),
             "conn": conn or {},
+            "trusted_ssid": trusted,
             "autostart": sorted(self._autostart_files()),
             "code": {
                 "app.py": self._hash(ROOT / "app.py"),
@@ -6095,13 +6261,13 @@ class FinchPane(QWidget):
                 if self._dedupe(key):
                     continue
                 dev = base.get("dev", "wlan0")
-                action = f"ip neigh replace {ip} lladdr {old} dev {dev}"
                 if self.posture == "HARVEST":
-                    self._bite(f"ARP POISON {ip} → {mac}: WOULD RESTORE {old} on {dev}", None)
+                    self._bite(f"ARP POISON {ip} → {mac}: WOULD PIN {old} on {dev} + drop {mac}", None)
                     continue
-                r = self._run(["ip", "neigh", "replace", ip, "lladdr", old, "dev", dev])
-                ok = "ok" if (r and not r.returncode) else (f"fail {r.returncode if r else '?'}")
-                self._bite(f"ARP POISON — bitten: restored neighbour {ip} → {old} ({ok})", action)
+                ok = self._arp_restore(ip, old, dev, attacker=mac)
+                self._bite(f"ARP POISON — bitten: restored neighbour {ip} → {old} ({ok})",
+                           f"sudo ip neigh replace {ip} lladdr {old} dev {dev} nud permanent; "
+                           f"arptables drop reply {ip} from {mac}")
 
     def _persist_bite(self, base):
         now = self._autostart_files()
@@ -6154,19 +6320,55 @@ class FinchPane(QWidget):
         except Exception:
             return None
 
-    def _surge(self):
-        out = self._run(["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show", "--active"])
-        prof = None
+    def _trusted_ssid(self):
+        return (self.baseline.get("trusted_ssid")
+                or self.baseline.get("conn", {}).get("ssid")
+                or None)
+
+    def _wifi_profiles(self):
+        out = self._run(["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"])
+        profs = []
         if out:
             for line in out.stdout.splitlines():
                 p = nmcli_tokens(line)
                 if len(p) >= 2 and "wireless" in p[1]:
-                    prof = p[0]
+                    profs.append(p[0])
+        return profs
+
+    def _surge(self):
+        """Come back onto the TRUSTED network, not whatever is merely active.
+
+        A hijack/deauth/twin bite must restore the link we vetted, otherwise we
+        just rejoin the attacker's AP. Falls back gracefully when the trusted
+        SSID has no saved profile.
+        """
+        trusted = self._trusted_ssid()
+        profs = self._wifi_profiles()
+        if trusted:
+            pick = next((p for p in profs if p == trusted), None) \
+                or next((p for p in profs if trusted.lower() in p.lower()), None)
+            if pick:
+                r = self._run(["nmcli", "connection", "up", pick])
+                if r and not r.returncode:
+                    return f"surged to trusted '{pick}'"
+            # no saved profile carries it — (re)join the SSID by name (stored key)
+            r = self._run(["nmcli", "dev", "wifi", "connect", trusted])
+            if r and not r.returncode:
+                return f"rejoined trusted '{trusted}'"
+        # last resort: a saved wireless profile, then whatever is active
+        active = None
+        out = self._run(["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show", "--active"])
+        if out:
+            for line in out.stdout.splitlines():
+                p = nmcli_tokens(line)
+                if len(p) >= 2 and "wireless" in p[1]:
+                    active = p[0]
                     break
-        if not prof:
+        target = profs[0] if profs else active
+        if not target:
             return "no wifi profile"
-        r = self._run(["nmcli", "connection", "up", prof])
-        return "surged" if (r and not r.returncode) else f"fail {r.returncode if r else '?'}"
+        r = self._run(["nmcli", "connection", "up", target])
+        return f"surged to {target}" if (r and not r.returncode) else f"fail {r.returncode if r else '?'}"
 
     def _hop_bite(self, base):
         gw = self._gw()
@@ -6181,13 +6383,14 @@ class FinchPane(QWidget):
         if self._dedupe(key, window=90):
             return
         dev = base.get("dev", "wlan0")
-        self._run(["ip", "neigh", "replace", gw, "lladdr", old, "dev", dev])
         if self.posture == "HARVEST":
-            self._bite(f"GATEWAY HIJACK {gw} {mac}: WOULD restore {old} + surge on {dev}", None)
+            self._bite(f"GATEWAY HIJACK {gw} {mac}: WOULD PIN {old} on {dev} + drop {mac} + surge", None)
             return
+        guard = self._arp_restore(gw, old, dev, attacker=mac)
         ok = self._surge()
-        self._bite(f"GATEWAY HIJACK {gw} {mac} — bitten: restored {old} on {dev}, {ok}",
-                   f"ip neigh replace {gw} {old} + surge")
+        self._bite(f"GATEWAY HIJACK {gw} {mac} — bitten: {guard} on {dev}, {ok}",
+                   f"sudo ip neigh replace {gw} lladdr {old} dev {dev} nud permanent; "
+                   f"arptables drop reply {gw} from {mac}; surge trusted")
 
     def _deauth_bite(self, base):
         now = time.time()
@@ -6520,16 +6723,63 @@ class FinchPane(QWidget):
                 if path.startswith("/tmp/"):
                     dst = self.qdir / "exec"
                     dst.mkdir(exist_ok=True)
-                    try:
-                        shutil.move(path, str(dst / Path(path).name) + ".quar")
-                        moved = " + moved to quarantine"
-                    except OSError:
-                        moved = ""
+                    moved = self._quarantine(path, dst)
                 ok = "revoked" if (r and not r.returncode) else (f"fail {r.returncode if r else '?'}")
                 self._bite(f"NEW EXEC {path} — bitten: exec revoked ({ok}){moved}",
                            f"chmod -x {path}")
         self._exec = cur
         self._save(self._exec, self.exec_f)
+
+    # Keep the quarantine bounded: one stored copy per content hash, plus a
+    # hard cap on count/bytes (evict oldest). Stops the same binary (e.g. a
+    # library an editor/IDE keeps dropping in /tmp) from being stored forever.
+    QUAR_MAX_FILES = 25
+    QUAR_MAX_BYTES = 100 * 1024 * 1024
+
+    def _quarantine(self, path, dst):
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            return ""
+        h = hashlib.sha256(data).hexdigest()
+        idx_f = dst / "index.json"
+        idx = self._load(idx_f) or {}
+        stored = idx.get(h)
+        if stored and (dst / stored).exists():
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            return f" + dropped (same binary already held as {stored})"
+        name = Path(path).name + ".quar"
+        try:
+            shutil.move(path, str(dst / name))
+        except OSError:
+            return ""
+        idx[h] = name
+        try:
+            live = []
+            for n in list(idx.values()):
+                p = dst / n
+                if p.exists():
+                    live.append((p, n))
+            live.sort(key=lambda t: t[0].stat().st_mtime)
+            total = sum(p.stat().st_size for p, _ in live)
+            while live and (len(live) > self.QUAR_MAX_FILES or total > self.QUAR_MAX_BYTES):
+                p, n = live.pop(0)
+                total -= p.stat().st_size
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+                for k, v in list(idx.items()):
+                    if v == n:
+                        idx.pop(k, None)
+        except OSError:
+            pass
+        self._save(idx, idx_f)
+        return f" + moved to quarantine ({len(idx)} held)"
 
     def _is_private(self, ip):
         if ip.startswith(("10.", "127.", "192.168.", "169.254.", "fe8", "fc", "fd")):
@@ -6797,6 +7047,13 @@ class Raven(QMainWindow):
         self.finch = FinchPane(self.log, self.report)
         finch.add(self.finch)
         self.tabs.addTab(finch, "Finch")
+
+        # Systemwatch — the whole-host eye (dormant until armed)
+        swatch = Panel("SYSTEMWATCH", "whole-host eye // process injection + file access · "
+                                      "dormant until armed")
+        self.systemwatch = SystemwatchPane(self.log, self.report)
+        swatch.add(self.systemwatch)
+        self.tabs.addTab(swatch, "Systemwatch")
 
         # Lifeline — the unconscious twin (was: Scan)
         lifeline = Panel("LIFELINE", "unconscious twin // never offline, at any cost")
