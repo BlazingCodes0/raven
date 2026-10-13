@@ -1,7 +1,0 @@
-# Nmap 7.99 scan initiated Thu Oct  8 15:39:31 2026 as: /usr/lib/nmap/nmap --privileged -sn -PR -PS22,80,443,5353 -oA /home/a/raven/crow/crow-1_eyes_live 172.20.10.0/28
-Nmap scan report for 172.20.10.1
-Host is up (0.016s latency).
-MAC Address: B6:56:E3:CD:BB:64 (Unknown)
-Nmap scan report for 172.20.10.2
-Host is up.
-# Nmap done at Thu Oct  8 15:39:34 2026 -- 16 IP addresses (2 hosts up) scanned in 2.55 seconds

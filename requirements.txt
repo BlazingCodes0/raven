@@ -1,0 +1,6 @@
+# Python dependencies (standard library does the rest)
+PyQt6
+
+# External command-line tools Raven shells out to (install via your OS package
+# manager; they are not pip packages):
+#   nmap, arp-scan, tshark, suricata, iptables, dnsutils (dig/host)

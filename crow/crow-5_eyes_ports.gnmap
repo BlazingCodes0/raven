@@ -1,6 +1,0 @@
-# Nmap 7.99 scan initiated Thu Oct  8 16:05:49 2026 as: /usr/lib/nmap/nmap --privileged -Pn -sV --top-ports 200 -oA /home/a/raven/crow/crow-5_eyes_ports 172.20.10.0/28
-Host: 172.20.10.1 ()	Status: Up
-Host: 172.20.10.1 ()	Ports: 21/open/tcp//ftp?///, 53/open/tcp//domain//(generic dns response: NXDOMAIN)/, 49152/open/tcp//tcpwrapped///	Ignored State: closed (197)
-Host: 172.20.10.2 ()	Status: Up
-Host: 172.20.10.2 ()	Ports: 	Ignored State: filtered (200)
-# Nmap done at Thu Oct  8 16:09:11 2026 -- 16 IP addresses (2 hosts up) scanned in 202.79 seconds
