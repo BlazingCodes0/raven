@@ -3334,6 +3334,26 @@ def wifi_profile():
     return None
 
 
+def wifi_dev():
+    # A wireless interface to heal even when there is no default route — the
+    # route is gone precisely BECAUSE the wifi dropped, so `route()` yields no dev
+    # and the old code healed nothing. Prefer a radio with carrier, else any
+    # wireless device.
+    try:
+        names = os.listdir("/sys/class/net")
+    except OSError:
+        return None
+    wl = [n for n in names if os.path.isdir("/sys/class/net/%s/wireless" % n)]
+    for n in wl:
+        try:
+            with open("/sys/class/net/%s/carrier" % n) as f:
+                if f.read().strip() == "1":
+                    return n
+        except OSError:
+            pass
+    return wl[0] if wl else None
+
+
 def dhcp_renew(dev):
     shout("sudo -n ip link set %s mtu 1500 2>/dev/null" % dev)
     shout("sudo -n dhclient -v -r %s 2>/dev/null; sleep 2; sudo -n dhclient -v %s 2>/dev/null" % (dev, dev))
@@ -4048,7 +4068,12 @@ def main():
                     if dev:
                         heal(dev, strikes)
                     else:
-                        ev("CRIT", "no default route — faint but watching; nothing to bounce")
+                        alt = wifi_dev()
+                        if alt:
+                            ev("CRIT", "no default route — resurrecting wireless %s" % alt)
+                            heal(alt, strikes)
+                        else:
+                            ev("CRIT", "no default route and no wireless device — nothing to bounce")
                 elif not dev:
                     ev("CRIT", "no default route — faint but watching; nothing to bounce")
         except Exception as ex:
@@ -4057,8 +4082,9 @@ def main():
             c = ctl()
             if c.get("panic"):
                 ev("PANIC", "manual resurrect ordered by the operator")
-                if route()[0]:
-                    heal(route()[0], 6)
+                pdev = route()[0] or wifi_dev()
+                if pdev:
+                    heal(pdev, 6)
                 c["panic"] = 0          # one click = one resurrect; consume the flag
                 with open(CONTROL, "w") as f:
                     json.dump(c, f)
@@ -5686,6 +5712,9 @@ class ShieldPane(QWidget):
         self.baseline["at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         self.baseline["neigh"] = self._neigh()
         self.baseline["gateway"] = self._gateway()
+        iface = default_iface()
+        self.baseline["wifi_iface"] = (
+            iface if os.path.isdir("/sys/class/net/%s/wireless" % iface) else None)
         self.baseline["aps"] = self._aps()
         self.conn_ssid, self.conn_bssid = self._link()
         # if we're momentarily offline, don't seed an empty reference — keep the
@@ -5720,10 +5749,35 @@ class ShieldPane(QWidget):
         return time.time() - self.t0 < 8
 
     # --- line-loss recovery: drop, resurrect, re-arm ----------------------
-    def _gateway_back(self):
-        """The baseline gateway, if it's back in the neighbour table."""
-        gw = self.baseline.get("gateway")
-        return gw if gw and gw in self._neigh() else None
+    def _twin_up(self):
+        """The twin's own heartbeat, if the line is genuinely back: the twin
+        probes the WAN every beat, so a fresh `up` is a real answer — not just
+        radio association, and not a stale ARP entry over a route-less link."""
+        try:
+            with open(STATE_PATH) as f:
+                st = json.load(f)
+        except Exception:
+            return None
+        if not st.get("up"):
+            return None
+        try:
+            if time.time() - int(st.get("ts") or 0) > 12:
+                return None
+        except Exception:
+            return None
+        return st.get("gw") or self.baseline.get("gateway") or "the line"
+
+    def _line_back(self):
+        """The line is genuinely back — not merely associated, and not a stale ARP
+        entry over a route-less interface (which is what seeded a `gateway None`
+        baseline before). Prefer the twin's heartbeat; else a live default route
+        through the baseline gateway."""
+        up = self._twin_up()
+        if up:
+            return up
+        gw = self._gateway()
+        base_gw = self.baseline.get("gateway")
+        return gw if gw and (not base_gw or gw == base_gw) else None
 
     def _ensure_twin(self):
         """Make sure the unconscious twin is beating so it can run the resurrect
@@ -5761,13 +5815,12 @@ class ShieldPane(QWidget):
         self._recover.start(10000)
 
     def _recover_step(self):
-        gw = self._gateway_back()
-        if gw:
+        back = self._line_back()
+        if back:
             self._recover.stop()
             self.recovering = False
             self.arm()
-            self.speak("SHIELD RE-ARMED — gateway %s is back in the neighbour table" % gw,
-                       SEV_LOW)
+            self.speak("SHIELD RE-ARMED — line is back (%s)" % back, SEV_LOW)
             return
         self._recover_n += 1
         self._ensure_twin()
@@ -5776,12 +5829,63 @@ class ShieldPane(QWidget):
                    "neighbour table)" % (self._recover_n, self.baseline.get("gateway") or "?"),
                    SEV_MED)
 
+    def _wifi_iface(self):
+        """The wireless radio this shield was armed on, or None when the lifeline
+        was not wifi (so wifi checks stay silent on a wired link)."""
+        return self.baseline.get("wifi_iface")
+
+    def _associated_ssid(self):
+        """(ok, ssid) read straight from `iw` with no fallback to a remembered
+        name: ok is False if the link could not be read at all, ssid is None when
+        the radio is genuinely unassociated."""
+        iface = self._wifi_iface()
+        if not iface:
+            return False, None
+        try:
+            out = subprocess.run(["iw", "dev", iface, "link"],
+                                 capture_output=True, text=True, timeout=4).stdout
+        except Exception:
+            return False, None
+        m = re.search(r"SSID: *(.+)", out)
+        return True, (m.group(1).strip() if m else None)
+
+    def _wifi_lost(self, aps):
+        """Reason the armed wifi has dropped out, else None. Catches the drop the
+        ARP check misses: the radio lost association, or the connected SSID has
+        vanished from the scan table while a stale default route kept the gateway
+        in the neighbour table."""
+        want = self.baseline.get("conn_ssid") or self.baseline.get("trusted_ssid")
+        if not want or not self._wifi_iface():
+            return None
+        ok, assoc = self._associated_ssid()
+        if ok and not assoc:
+            return "wifi radio is no longer associated (was '%s')" % want
+        seen = {a["ssid"] for a in aps if a.get("ssid")}
+        if aps and want not in seen:
+            return "wifi '%s' disappeared from the table" % want
+        return None
+
+    def _wifi_check(self, aps):
+        """The armed wifi dropped: treat it exactly like a lost line — drop the
+        shield, order a resurrect, and re-arm on the fresh link."""
+        if self._learning() or self.recovering:
+            return
+        why = self._wifi_lost(aps)
+        if why:
+            self._line_lost(why)
+
     def _poll(self):
         if not self.armed:
             return
         self._arp_check(self._neigh(), self.baseline.get("neigh", {}), self.baseline.get("gateway"))
+        if not self.armed:            # the gateway check may have dropped the shield
+            return
         self.conn_ssid, self.conn_bssid = self._link()
-        self._ap_check(self._aps(), self.baseline.get("aps", []))
+        aps = self._aps()
+        self._ap_check(aps, self.baseline.get("aps", []))
+        self._wifi_check(aps)
+        if not self.armed:            # the wifi check may have dropped the shield
+            return
         self._listen_check(self._listeners(), self.baseline.get("listeners", []))
         self._persist_check(self._autostart_files(), self.baseline.get("autostart", []))
         self._code_check({

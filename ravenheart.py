@@ -161,6 +161,26 @@ def wifi_profile():
     return None
 
 
+def wifi_dev():
+    # A wireless interface to heal even when there is no default route — the
+    # route is gone precisely BECAUSE the wifi dropped, so `route()` yields no dev
+    # and the old code healed nothing. Prefer a radio with carrier, else any
+    # wireless device.
+    try:
+        names = os.listdir("/sys/class/net")
+    except OSError:
+        return None
+    wl = [n for n in names if os.path.isdir("/sys/class/net/%s/wireless" % n)]
+    for n in wl:
+        try:
+            with open("/sys/class/net/%s/carrier" % n) as f:
+                if f.read().strip() == "1":
+                    return n
+        except OSError:
+            pass
+    return wl[0] if wl else None
+
+
 def dhcp_renew(dev):
     shout("sudo -n ip link set %s mtu 1500 2>/dev/null" % dev)
     shout("sudo -n dhclient -v -r %s 2>/dev/null; sleep 2; sudo -n dhclient -v %s 2>/dev/null" % (dev, dev))
@@ -875,7 +895,12 @@ def main():
                     if dev:
                         heal(dev, strikes)
                     else:
-                        ev("CRIT", "no default route — faint but watching; nothing to bounce")
+                        alt = wifi_dev()
+                        if alt:
+                            ev("CRIT", "no default route — resurrecting wireless %s" % alt)
+                            heal(alt, strikes)
+                        else:
+                            ev("CRIT", "no default route and no wireless device — nothing to bounce")
                 elif not dev:
                     ev("CRIT", "no default route — faint but watching; nothing to bounce")
         except Exception as ex:
@@ -884,8 +909,9 @@ def main():
             c = ctl()
             if c.get("panic"):
                 ev("PANIC", "manual resurrect ordered by the operator")
-                if route()[0]:
-                    heal(route()[0], 6)
+                pdev = route()[0] or wifi_dev()
+                if pdev:
+                    heal(pdev, 6)
                 c["panic"] = 0          # one click = one resurrect; consume the flag
                 with open(CONTROL, "w") as f:
                     json.dump(c, f)

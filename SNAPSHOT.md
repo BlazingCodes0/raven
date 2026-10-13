@@ -397,8 +397,32 @@ FINDINGS chips row under each crow = raw IPs/domains from output, click to copy
   twin if it's dead), and **re-arms on the fresh link** once the baseline gateway
   is back in the neighbour table. So a dropped line is fought automatically and
   the shield re-baselines on the recovered link.
-- **Verify:** headless state-machine test -> `order_resurrect` writes `panic` to
-  both files; `_line_lost` drops + starts recovery; an absent tick increments; a
-  back tick stops and re-arms. `py_compile` clean.
+- **The wifi itself dropping now also triggers it, and the twin can actually heal
+  it.** A stale default route can keep the gateway in the neighbour table after the
+  radio drops, so `_wifi_check` (called every poll) reads the link directly: `iw`
+  says the radio is no longer associated, or the connected SSID has vanished from
+  the `nmcli` scan table (the "table"). Either way it calls the same `_line_lost` —
+  drop, resurrect, re-arm. The armed interface is recorded at arm as
+  `baseline["wifi_iface"]`; when the lifeline is wired (no wireless device) the
+  wifi checks stay silent, so a wired host is never bounced by an idle radio.
+- **Re-arm requires a genuinely restored line — not mere association.** The old
+  re-arm condition (baseline gateway back in the neighbour table) could be met by a
+  lingering stale ARP entry over a route-less interface, so the shield re-armed and
+  seeded `gateway: None` — blinding it and stopping the healer. `_recover_step` now
+  re-arms only on `_line_back()`: the twin's own fresh WAN heartbeat (`state.json`
+  `up`, written within 12s) preferred, else a live default route through the
+  baseline gateway. A different uplink is not silently re-blessed.
+- **Why the line stayed down (the real root of "I had to do it by hand").** When
+  the wifi fully drops there is no default route, so `route()` returned no device
+  and the twin's auto-resurrect / panic path **never called `heal()`** — it only
+  logged "nothing to bounce". New `wifi_dev()` (in `ravenheart.py` and the embedded
+  `RAVENHEART_SRC`) falls back to a wireless interface (carrier first, else any
+  wireless device) so the resurrect now re-associates even with the route gone.
+- **Verify:** `python3 -u /tmp/opencode/test_shield_wifi_recovery.py` -> 12/12
+  (unassociated -> drop; in table -> quiet; gone from table -> drop; `_wifi_check`
+  orders the resurrect and drops armed; wired link silent; fresh twin heartbeat ->
+  line named, stale/down -> ignored; no line -> keeps resurrecting without
+  re-arming; twin up / live route -> re-arms; different uplink -> not blessed).
+  `RAVENHEART_SRC` == `ravenheart.py` byte-for-byte; `py_compile` clean on both.
 - **State:** raven down, survival off. Host arpguard rules are **not** currently
   armed (a reboot cleared them) — finch re-arms them on its next start.
