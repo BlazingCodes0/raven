@@ -4075,6 +4075,28 @@ if __name__ == "__main__":
 """
 
 
+def order_resurrect():
+    """Order the twin's one-shot max heal — exactly what pressing RESURRECT NOW
+    does: write the `panic` flag the twin consumes on its next beat, to the live
+    file and the ~/.ravenheart mirror. Returns True if the order was written."""
+    ok = False
+    for p in (CONTROL_PATH, MCONTROL_PATH):
+        try:
+            try:
+                with open(p) as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+            p.parent.mkdir(parents=True, exist_ok=True)
+            data["panic"] = int(time.time())
+            with open(p, "w") as f:
+                json.dump(data, f)
+            ok = True
+        except OSError:
+            continue
+    return ok
+
+
 class LifelinePane(QWidget):
     """The unconscious twin — an always-on beat that refuses to let this host go dark.
     The twin runs as its own process (ravenheart.py), so killing Raven's window
@@ -4594,6 +4616,37 @@ CRACK_RE = re.compile(
 )
 
 
+def self_face_guard(dev):
+    """True when seizing `dev` for monitor mode would cut THIS box's own uplink:
+    the radio carries the box's default route and there is no other live carrier
+    to fall back on. Going LOUD would then kick the box off the very wifi it is
+    using — the self-inflicted deauth that keeps dropping the connection.
+    Set RAVEN_LOUD_FORCE=1 for an intentional lab run to bypass."""
+    if os.environ.get("RAVEN_LOUD_FORCE") == "1":
+        return False
+    if not dev:
+        return False
+    try:
+        out = subprocess.run(["ip", "-4", "route", "show", "default"],
+                             capture_output=True, text=True, timeout=5).stdout or ""
+        default_ifs = set(re.findall(r"\bdev (\S+)", out))
+    except Exception:
+        return False
+    if dev not in default_ifs:
+        return False
+    try:
+        for name in os.listdir("/sys/class/net"):
+            if name in ("lo", dev):
+                continue
+            if os.path.isfile("/sys/class/net/%s/carrier" % name):
+                with open("/sys/class/net/%s/carrier" % name) as f:
+                    if f.read().strip() == "1":
+                        return False
+    except Exception:
+        pass
+    return True
+
+
 class AskRavenTerm(QWidget):
     """Birdshit's own ASK RAVEN terminal.
 
@@ -4931,6 +4984,13 @@ class AskRavenTerm(QWidget):
             return
         self.speak(f"raven caught {pen['ssid']} on ch {pen['ch']} ({pen['bssid']}) — arming monitor…", NEON)
         self.speak(f"(this drops the connection on {pen['dev']} — that's normally the point.)", MUTED)
+        if self_face_guard(pen["dev"]):
+            self.speak(
+                f"raven: {pen['dev']} is carrying this box's own uplink right now — going LOUD "
+                "would kick YOU off the wifi we are on. Refusing the auto-escalation. For a real "
+                "lab run set RAVEN_LOUD_FORCE=1 (or start it from the Birdshit tab).", SEV_CRIT)
+            self._pen_cleanup(dropped=True)
+            return
         rc, out = self._run_sync(["sudo", "airmon-ng", "check", "kill"], 30)
         rc, out = self._run_sync(["sudo", "airmon-ng", "start", pen["dev"]], 40)
         if rc != 0 and "monitor mode enabled" not in out:
@@ -5444,6 +5504,12 @@ class ShieldPane(QWidget):
         self._last = {}
         self.conn_ssid = ""
         self.conn_bssid = ""
+        # when the gateway falls out of the neighbour table we drop the shield,
+        # order a resurrect, and keep ordering one periodically until it's back
+        self.recovering = False
+        self._recover_n = 0
+        self._recover = QTimer(self)
+        self._recover.timeout.connect(self._recover_step)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -5653,6 +5719,63 @@ class ShieldPane(QWidget):
     def _learning(self):
         return time.time() - self.t0 < 8
 
+    # --- line-loss recovery: drop, resurrect, re-arm ----------------------
+    def _gateway_back(self):
+        """The baseline gateway, if it's back in the neighbour table."""
+        gw = self.baseline.get("gateway")
+        return gw if gw and gw in self._neigh() else None
+
+    def _ensure_twin(self):
+        """Make sure the unconscious twin is beating so it can run the resurrect
+        we order. The Lifeline pane also keeps it alive; this is belt-and-braces
+        for the recovery path."""
+        try:
+            with open(PID_PATH) as f:
+                pid = int(f.read().strip())
+            os.kill(pid, 0)
+            return
+        except Exception:
+            pass
+        try:
+            subprocess.Popen([sys.executable, str(ROOT / "ravenheart.py")],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+        except Exception:
+            pass
+
+    def _line_lost(self, why):
+        """Gateway fell out of the neighbour table: drop the shield, order a
+        resurrect, and keep ordering one every 10s until the line is back — then
+        re-arm on the fresh link."""
+        if self.recovering:
+            return
+        self.recovering = True
+        self._recover_n = 0
+        self.armed = False
+        self.btn_arm.setText("ARM SHIELD")
+        self._ensure_twin()
+        order_resurrect()
+        self.speak("SHIELD DROPPED — " + why
+                   + "; ordered a resurrect, will re-arm when the line is back", SEV_HIGH)
+        self.report("SHIELD DROPPED — " + why)
+        self._recover.start(10000)
+
+    def _recover_step(self):
+        gw = self._gateway_back()
+        if gw:
+            self._recover.stop()
+            self.recovering = False
+            self.arm()
+            self.speak("SHIELD RE-ARMED — gateway %s is back in the neighbour table" % gw,
+                       SEV_LOW)
+            return
+        self._recover_n += 1
+        self._ensure_twin()
+        order_resurrect()
+        self.speak("line still down — resurrect ordered (#%d, gateway %s not in "
+                   "neighbour table)" % (self._recover_n, self.baseline.get("gateway") or "?"),
+                   SEV_MED)
+
     def _poll(self):
         if not self.armed:
             return
@@ -5692,6 +5815,7 @@ class ShieldPane(QWidget):
             msg = f"gateway {gw} disappeared from neighbour table"
             if not self._dedupe("arp:gone:" + gw, msg):
                 self._alarm(msg)
+                self._line_lost(msg)
 
     def _ap_check(self, aps, baseline_aps):
         base_ssids = {a["ssid"] for a in baseline_aps}

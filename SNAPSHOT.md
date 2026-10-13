@@ -388,5 +388,17 @@ FINDINGS chips row under each crow = raw IPs/domains from output, click to copy
 - **Verify:** `python3 -u /tmp/opencode/test_arpguard_wiring.py` -> 5/5 (arpguard
   imported; shield+finch keep the trusted ssid while offline; `_surge` ups /
   rejoins the trusted SSID). `py_compile` clean.
+- **Shield line-loss recovery (drop -> resurrect -> re-arm):** when the gateway
+  falls out of the neighbour table, the shield now **drops armed**, orders a
+  one-shot max heal through the new module helper `order_resurrect()` (writes
+  `panic` to `/tmp/ravenheart/control.json` + the `~/.ravenheart` mirror — the same
+  order as RESURRECT NOW), and starts a 10s `_recover` timer. Each tick it
+  re-orders a resurrect while the gateway is absent (`_ensure_twin` re-spawns the
+  twin if it's dead), and **re-arms on the fresh link** once the baseline gateway
+  is back in the neighbour table. So a dropped line is fought automatically and
+  the shield re-baselines on the recovered link.
+- **Verify:** headless state-machine test -> `order_resurrect` writes `panic` to
+  both files; `_line_lost` drops + starts recovery; an absent tick increments; a
+  back tick stops and re-arms. `py_compile` clean.
 - **State:** raven down, survival off. Host arpguard rules are **not** currently
   armed (a reboot cleared them) — finch re-arms them on its next start.
