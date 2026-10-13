@@ -191,3 +191,24 @@ if [ "${r,,}" != "n" ]; then
   bash "$REPO/raven_boot.sh" && say "raven is up. GUI + lifeline twin running."
 fi
 exit 0
+# 5) create user launchers (Desktop + Applications)
+if [ "$(id -u)" -ne 0 ]; then
+  SHARE="$HOME/.local/share/applications"
+  DESK="$HOME/Desktop"
+  mkdir -p "$SHARE" "$DESK"
+  cat > "$SHARE/Raven.desktop" <<EOD
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Raven
+Comment=Raven Lab (supervised with lifeline)
+Exec=$REPO/raven_boot.sh
+Icon=$REPO/assets/raven_neon.png
+Terminal=false
+Categories=Finance;Utility;
+EOD
+  cp -f "$SHARE/Raven.desktop" "$DESK/Raven.desktop" 2>/dev/null || true
+  chmod +x "$SHARE/Raven.desktop" "$DESK/Raven.desktop" 2>/dev/null || true
+  chmod +x "$REPO/raven_boot.sh" 2>/dev/null || true
+  say "launchers installed: $DESK/Raven.desktop and $SHARE/Raven.desktop"
+fi
