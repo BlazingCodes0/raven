@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Raven
+Comment=Raven Lab (supervised with lifeline)
+Exec=/home/a/raven/raven_boot.sh
+Icon=/home/a/raven/assets/raven_neon.png
+Terminal=false
+Categories=Finance;Utility;
