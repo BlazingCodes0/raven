@@ -418,11 +418,19 @@ FINDINGS chips row under each crow = raw IPs/domains from output, click to copy
   logged "nothing to bounce". New `wifi_dev()` (in `ravenheart.py` and the embedded
   `RAVENHEART_SRC`) falls back to a wireless interface (carrier first, else any
   wireless device) so the resurrect now re-associates even with the route gone.
-- **Verify:** `python3 -u /tmp/opencode/test_shield_wifi_recovery.py` -> 12/12
+- **The standing 30s order (the operator's ask, kept simple):** the shield runs a
+  30s `self.cycle` timer that calls `_resurrect_cycle` — it fires **RESURRECT NOW**
+  (`order_resurrect()`), ensures the twin (`_ensure_twin`), and then **ARM/re-base**
+  (`arm()`), i.e. the same two buttons, on a timer. If it lands mid-recovery it
+  clears the `recovering` state before re-arming. This re-baselines the shield every
+  cycle by design (the operator wants the constant heal+rebase), which is coarser
+  than the event-driven `_line_lost` path above — both run together.
+- **Verify:** `python3 -u /tmp/opencode/test_shield_wifi_recovery.py` -> 13/13
   (unassociated -> drop; in table -> quiet; gone from table -> drop; `_wifi_check`
   orders the resurrect and drops armed; wired link silent; fresh twin heartbeat ->
   line named, stale/down -> ignored; no line -> keeps resurrecting without
-  re-arming; twin up / live route -> re-arms; different uplink -> not blessed).
+  re-arming; twin up / live route -> re-arms; different uplink -> not blessed;
+  30s cycle -> resurrect ordered + shield re-armed/re-based).
   `RAVENHEART_SRC` == `ravenheart.py` byte-for-byte; `py_compile` clean on both.
 - **State:** raven down, survival off. Host arpguard rules are **not** currently
   armed (a reboot cleared them) — finch re-arms them on its next start.

@@ -5536,6 +5536,10 @@ class ShieldPane(QWidget):
         self._recover_n = 0
         self._recover = QTimer(self)
         self._recover.timeout.connect(self._recover_step)
+        # the operator's standing order: every 30s run RESURRECT NOW and re-arm
+        # (re-base) the shield — the exact two buttons, on a timer
+        self.cycle = QTimer(self)
+        self.cycle.timeout.connect(self._resurrect_cycle)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -5562,6 +5566,7 @@ class ShieldPane(QWidget):
         self.tick = QTimer(self)
         self.tick.timeout.connect(self._poll)
         self.tick.start(4000)
+        self.cycle.start(30000)
         self.speak("shield awaits — ARM to baseline your neighbours, network, listeners, autostart and code", SEV_INFO)
 
     # --- basics -----------------------------------------------------------
@@ -5796,6 +5801,16 @@ class ShieldPane(QWidget):
                              start_new_session=True)
         except Exception:
             pass
+
+    def _resurrect_cycle(self):
+        """The operator's standing order, every 30s: run RESURRECT NOW and re-arm
+        (re-base) the shield — the same two buttons, on a timer."""
+        order_resurrect()
+        self._ensure_twin()
+        if self.recovering:
+            self._recover.stop()
+            self.recovering = False
+        self.arm()
 
     def _line_lost(self, why):
         """Gateway fell out of the neighbour table: drop the shield, order a
